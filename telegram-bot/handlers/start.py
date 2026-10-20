@@ -1,0 +1,21 @@
+from __future__ import annotations
+
+from aiogram import Router
+from aiogram.filters import CommandStart
+from aiogram.types import Message
+
+router = Router(name="start")
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    await message.answer(
+        "Привет! Я бот-органайзер для твоих планов 🗓\n\n"
+        "Вот что я умею:\n"
+        "/MyPlans — посмотреть планы на неделю или конкретный день\n"
+        "/NewPlan — добавить новую задачу\n"
+        "/everyN — добавить повторяющуюся задачу\n"
+        "/database — получить файл своей базы данных\n\n"
+        "Также в любой момент можешь просто написать дату (например, 19.10 "
+        "или «в четверг»), и я покажу планы на этот день."
+    )
