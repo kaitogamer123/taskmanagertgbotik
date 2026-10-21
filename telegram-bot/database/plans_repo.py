@@ -21,6 +21,7 @@ class PlanItem:
     time_end: Optional[str]
     title: str
     description: Optional[str]
+    reminder_minutes: Optional[int] = None
 
     def sort_key(self):
         return (0 if self.time_start else 1, self.time_start or "99:99")
@@ -40,13 +41,14 @@ def add_plan(
     time_start: Optional[str],
     time_end: Optional[str],
     description: Optional[str],
+    reminder_minutes: Optional[int] = None,
 ) -> int:
     cur = db.conn.execute(
         """
-        INSERT INTO plans (plan_date, time_start, time_end, title, description)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO plans (plan_date, time_start, time_end, title, description, reminder_minutes, reminder_sent)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
         """,
-        (plan_date.isoformat(), time_start, time_end, title, description),
+        (plan_date.isoformat(), time_start, time_end, title, description, reminder_minutes or None),
     )
     db.conn.commit()
     return cur.lastrowid
@@ -61,12 +63,13 @@ def add_recurring_rule(
     start_date: date,
     rule_type: str,
     rule_value: str,
+    reminder_minutes: Optional[int] = None,
 ) -> int:
     cur = db.conn.execute(
         """
         INSERT INTO recurring_rules
-            (title, description, time_start, time_end, start_date, rule_type, rule_value, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            (title, description, time_start, time_end, start_date, rule_type, rule_value, created_at, reminder_minutes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
         """,
         (
             title,
@@ -76,10 +79,27 @@ def add_recurring_rule(
             start_date.isoformat(),
             rule_type,
             rule_value,
-            ),
+            reminder_minutes or None,
+        ),
     )
     db.conn.commit()
     return cur.lastrowid
+
+
+def update_plan_reminder(db: UserDB, plan_id: int, reminder_minutes: Optional[int]) -> None:
+    db.conn.execute(
+        "UPDATE plans SET reminder_minutes = ?, reminder_sent = 0 WHERE id = ?",
+        (reminder_minutes or None, plan_id),
+    )
+    db.conn.commit()
+
+
+def update_rule_reminder(db: UserDB, rule_id: int, reminder_minutes: Optional[int]) -> None:
+    db.conn.execute(
+        "UPDATE recurring_rules SET reminder_minutes = ?, last_reminder_date = NULL WHERE id = ?",
+        (reminder_minutes or None, rule_id),
+    )
+    db.conn.commit()
 
 
 def _rule_occurs_on(rule: sqlite3.Row, d: date) -> bool:
@@ -126,6 +146,7 @@ def get_plans_for_date(db: UserDB, d: date) -> list[PlanItem]:
                 time_end=row["time_end"],
                 title=row["title"],
                 description=row["description"],
+                reminder_minutes=row["reminder_minutes"],
             )
         )
 
@@ -140,6 +161,7 @@ def get_plans_for_date(db: UserDB, d: date) -> list[PlanItem]:
                     time_end=rule["time_end"],
                     title=rule["title"],
                     description=rule["description"],
+                    reminder_minutes=rule["reminder_minutes"],
                 )
             )
 

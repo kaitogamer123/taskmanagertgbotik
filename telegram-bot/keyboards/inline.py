@@ -6,6 +6,7 @@ from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database.plans_repo import PlanItem
+from database.settings_repo import NotifySettings
 from utils.date_utils import format_date_ru, get_week_window, weekday_name
 
 
@@ -32,6 +33,20 @@ def day_plans_keyboard(d: date, items: list[PlanItem]):
         InlineKeyboardButton(
             text="➕ Добавить задачу", callback_data=f"addto:{d.isoformat()}"
         )
+    )
+    return builder.as_markup()
+
+
+def item_detail_keyboard(d: date, item: PlanItem):
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="⏰ Изменить время оповещения",
+            callback_data=f"remind_edit:{item.kind}:{item.source_id}:{d.isoformat()}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"day:{d.isoformat()}")
     )
     return builder.as_markup()
 
@@ -82,4 +97,61 @@ def weekday_multiselect_keyboard(selected: set[int]):
             )
         )
     builder.row(InlineKeyboardButton(text="Готово ✔️", callback_data="wd_done"))
+    return builder.as_markup()
+
+
+# --- Напоминания ("за сколько времени до задачи напомнить") ---
+
+REMINDER_PRESETS: list[tuple[str, int]] = [
+    ("15 минут", 15),
+    ("30 минут", 30),
+    ("1 час", 60),
+    ("2 часа", 120),
+    ("1 день", 24 * 60),
+]
+
+
+def reminder_choice_keyboard(prefix: str):
+    """
+    prefix — префикс callback_data, например "np_rem" / "en_rem" / "redit_rem".
+    Итоговые callback_data: "{prefix}:{minutes}" и "{prefix}:off".
+    """
+    builder = InlineKeyboardBuilder()
+    for label, minutes in REMINDER_PRESETS:
+        builder.row(InlineKeyboardButton(text=f"⏰ {label}", callback_data=f"{prefix}:{minutes}"))
+    builder.row(InlineKeyboardButton(text="🔕 Без напоминания", callback_data=f"{prefix}:off"))
+    return builder.as_markup()
+
+
+# --- Настройки ежедневных уведомлений (/notify) ---
+
+
+def settings_keyboard(settings: NotifySettings):
+    builder = InlineKeyboardBuilder()
+    morning_mark = "✅" if settings.morning_enabled else "🚫"
+    evening_mark = "✅" if settings.evening_enabled else "🚫"
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🌅 Утром в {settings.morning_time} ({morning_mark})",
+            callback_data="settings_edit:morning",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="Выключить утро" if settings.morning_enabled else "Включить утро",
+            callback_data="settings_toggle:morning",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🌙 Вечером в {settings.evening_time} ({evening_mark})",
+            callback_data="settings_edit:evening",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="Выключить вечер" if settings.evening_enabled else "Включить вечер",
+            callback_data="settings_toggle:evening",
+        )
+    )
     return builder.as_markup()

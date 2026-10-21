@@ -15,9 +15,9 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
-from config import PLANES_USER_DIR, USERNAME_RECHECK_INTERVAL
+from config import DEFAULT_EVENING_TIME, DEFAULT_MORNING_TIME, PLANES_USER_DIR, USERNAME_RECHECK_INTERVAL
 from database.seed import seed_demo_data
 
 INDEX_FILE = PLANES_USER_DIR / "_index.json"
@@ -68,7 +68,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             time_start TEXT,
             time_end TEXT,
             title TEXT NOT NULL,
-            description TEXT
+            description TEXT,
+            reminder_minutes INTEGER,
+            reminder_sent INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS recurring_rules (
@@ -80,9 +82,50 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             start_date TEXT NOT NULL,
             rule_type TEXT NOT NULL,     -- interval | weekday | monthly | yearly
             rule_value TEXT NOT NULL,
-            created_at TEXT
+            created_at TEXT,
+            reminder_minutes INTEGER,
+            last_reminder_date TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS user_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            morning_enabled INTEGER NOT NULL DEFAULT 1,
+            morning_time TEXT NOT NULL DEFAULT '08:00',
+            evening_enabled INTEGER NOT NULL DEFAULT 1,
+            evening_time TEXT NOT NULL DEFAULT '20:00',
+            last_morning_sent TEXT,
+            last_evening_sent TEXT
         );
         """
+    )
+    conn.commit()
+    _migrate_schema(conn)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Добавляет новые колонки в базы, созданные до появления напоминаний."""
+    plans_cols = _table_columns(conn, "plans")
+    if "reminder_minutes" not in plans_cols:
+        conn.execute("ALTER TABLE plans ADD COLUMN reminder_minutes INTEGER")
+    if "reminder_sent" not in plans_cols:
+        conn.execute("ALTER TABLE plans ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
+
+    rules_cols = _table_columns(conn, "recurring_rules")
+    if "reminder_minutes" not in rules_cols:
+        conn.execute("ALTER TABLE recurring_rules ADD COLUMN reminder_minutes INTEGER")
+    if "last_reminder_date" not in rules_cols:
+        conn.execute("ALTER TABLE recurring_rules ADD COLUMN last_reminder_date TEXT")
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO user_settings (id, morning_time, evening_time)
+        VALUES (1, ?, ?)
+        """,
+        (DEFAULT_MORNING_TIME, DEFAULT_EVENING_TIME),
     )
     conn.commit()
 
@@ -221,3 +264,30 @@ def maybe_refresh_username(
         _save_index(index)
 
     return UserDB(new_path)
+
+
+def iter_all_user_ids() -> Iterator[int]:
+    """Перечисляет telegram_id всех пользователей, у которых есть база данных."""
+    for key in _load_index().keys():
+        try:
+            yield int(key)
+        except ValueError:
+            continue
+
+
+def open_user_db_by_id(telegram_id: int) -> Optional[UserDB]:
+    """
+    Открывает базу данных пользователя по его telegram_id без создания новой
+    (используется фоновым планировщиком уведомлений). Возвращает None, если
+    пользователь ещё никогда не писал боту.
+    """
+    index = _load_index()
+    filename = index.get(str(telegram_id))
+    if not filename:
+        return None
+    path = PLANES_USER_DIR / filename
+    if not path.exists():
+        return None
+    db = UserDB(path)
+    _create_schema(db.conn)
+    return db

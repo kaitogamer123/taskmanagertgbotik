@@ -9,9 +9,15 @@ from aiogram.types import CallbackQuery, Message
 
 from database.db_manager import UserDB
 from database.plans_repo import add_recurring_rule
-from keyboards.inline import every_n_type_keyboard, skip_keyboard, weekday_multiselect_keyboard
+from keyboards.inline import (
+    every_n_type_keyboard,
+    reminder_choice_keyboard,
+    skip_keyboard,
+    weekday_multiselect_keyboard,
+)
 from states import EveryNStates
 from utils.date_utils import format_date_full_ru, parse_natural_date, parse_time, weekday_name
+from utils.reminder_utils import describe_reminder, parse_reminder_offset
 from utils.repeat_parser import describe_rule, parse_repeat_phrase
 
 router = Router(name="everyn")
@@ -213,16 +219,55 @@ async def process_start_date(message: Message, state: FSMContext, db: UserDB) ->
     if parsed is None:
         await message.answer("Не понял дату, попробуй ещё раз, например 19.10 или «завтра».")
         return
-    await _save_rule(message, state, db, parsed)
+    await _ask_reminder_or_save(message, state, db, parsed)
 
 
 @router.callback_query(StateFilter(EveryNStates.waiting_start_date), F.data == "en_start_today")
 async def start_date_today(callback: CallbackQuery, state: FSMContext, db: UserDB) -> None:
     await callback.answer()
-    await _save_rule(callback.message, state, db, date.today())
+    await _ask_reminder_or_save(callback.message, state, db, date.today())
 
 
-async def _save_rule(message: Message, state: FSMContext, db: UserDB, start_date: date) -> None:
+async def _ask_reminder_or_save(
+    message: Message, state: FSMContext, db: UserDB, start_date: date
+) -> None:
+    await state.update_data(start_date=start_date.isoformat())
+    data = await state.get_data()
+    if not data.get("time_start"):
+        await _save_rule(message, state, db, reminder_minutes=None)
+        return
+
+    await state.set_state(EveryNStates.waiting_reminder)
+    await message.answer(
+        "За сколько времени до начала задачи напомнить? Выбери вариант или "
+        "напиши свой, например «за 45 минут»:",
+        reply_markup=reminder_choice_keyboard("en_rem"),
+    )
+
+
+@router.message(StateFilter(EveryNStates.waiting_reminder))
+async def process_reminder_text(message: Message, state: FSMContext, db: UserDB) -> None:
+    minutes = parse_reminder_offset(message.text or "")
+    if minutes is None:
+        await message.answer(
+            "Не понял 🙈 Напиши, например «30 минут», «1 час», «2 часа» "
+            "или нажми одну из кнопок выше."
+        )
+        return
+    await _save_rule(message, state, db, reminder_minutes=minutes)
+
+
+@router.callback_query(StateFilter(EveryNStates.waiting_reminder), F.data.startswith("en_rem:"))
+async def process_reminder_button(callback: CallbackQuery, state: FSMContext, db: UserDB) -> None:
+    _, value = callback.data.split(":", 1)
+    minutes = 0 if value == "off" else int(value)
+    await callback.answer()
+    await _save_rule(callback.message, state, db, reminder_minutes=minutes)
+
+
+async def _save_rule(
+    message: Message, state: FSMContext, db: UserDB, reminder_minutes: int | None
+) -> None:
     data = await state.get_data()
     title = data["title"]
     description = data.get("description")
@@ -230,9 +275,18 @@ async def _save_rule(message: Message, state: FSMContext, db: UserDB, start_date
     time_end = data.get("time_end")
     rule_type = data["rule_type"]
     rule_value = data["rule_value"]
+    start_date = date.fromisoformat(data["start_date"])
 
     add_recurring_rule(
-        db, title, description, time_start, time_end, start_date, rule_type, rule_value
+        db,
+        title,
+        description,
+        time_start,
+        time_end,
+        start_date,
+        rule_type,
+        rule_value,
+        reminder_minutes,
     )
     await state.clear()
 
@@ -246,6 +300,7 @@ async def _save_rule(message: Message, state: FSMContext, db: UserDB, start_date
         f"💬 {description or 'Описание отсутствует'}\n"
         f"🕐 {time_label}\n"
         f"🔁 {describe_rule(rule_type, rule_value)}\n"
-        f"📅 Начиная с {format_date_full_ru(start_date)} ({weekday_name(start_date)})\n\n"
+        f"📅 Начиная с {format_date_full_ru(start_date)} ({weekday_name(start_date)})\n"
+        f"{describe_reminder(reminder_minutes)}\n\n"
         "Посмотреть планы можно командой /MyPlans"
     )

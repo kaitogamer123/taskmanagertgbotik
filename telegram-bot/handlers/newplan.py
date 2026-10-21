@@ -9,9 +9,10 @@ from aiogram.types import CallbackQuery, Message
 
 from database.db_manager import UserDB
 from database.plans_repo import add_plan
-from keyboards.inline import skip_keyboard
+from keyboards.inline import reminder_choice_keyboard, skip_keyboard
 from states import NewPlanStates
 from utils.date_utils import format_date_full_ru, parse_natural_date, parse_time, weekday_name
+from utils.reminder_utils import describe_reminder, parse_reminder_offset
 
 router = Router(name="newplan")
 
@@ -117,7 +118,8 @@ _NO_DESCRIPTION_WORDS = {"нет", "без описания", "-", "пропус
 async def process_description(message: Message, state: FSMContext, db: UserDB) -> None:
     raw = (message.text or "").strip()
     description = None if raw.lower() in _NO_DESCRIPTION_WORDS or not raw else raw
-    await _save_plan(message, state, db, description)
+    await state.update_data(description=description)
+    await _ask_reminder_or_save(message, state, db)
 
 
 @router.callback_query(
@@ -125,19 +127,57 @@ async def process_description(message: Message, state: FSMContext, db: UserDB) -
 )
 async def skip_description(callback: CallbackQuery, state: FSMContext, db: UserDB) -> None:
     await callback.answer()
-    await _save_plan(callback.message, state, db, None)
+    await state.update_data(description=None)
+    await _ask_reminder_or_save(callback.message, state, db)
+
+
+async def _ask_reminder_or_save(message: Message, state: FSMContext, db: UserDB) -> None:
+    """Если у задачи указано время начала — спрашиваем про напоминание,
+    иначе сохраняем сразу (напоминание привязывать не к чему)."""
+    data = await state.get_data()
+    if not data.get("time_start"):
+        await _save_plan(message, state, db, reminder_minutes=None)
+        return
+
+    await state.set_state(NewPlanStates.waiting_reminder)
+    await message.answer(
+        "За сколько времени до начала задачи напомнить? Выбери вариант или "
+        "напиши свой, например «за 45 минут»:",
+        reply_markup=reminder_choice_keyboard("np_rem"),
+    )
+
+
+@router.message(StateFilter(NewPlanStates.waiting_reminder))
+async def process_reminder_text(message: Message, state: FSMContext, db: UserDB) -> None:
+    minutes = parse_reminder_offset(message.text or "")
+    if minutes is None:
+        await message.answer(
+            "Не понял 🙈 Напиши, например «30 минут», «1 час», «2 часа» "
+            "или нажми одну из кнопок выше."
+        )
+        return
+    await _save_plan(message, state, db, reminder_minutes=minutes)
+
+
+@router.callback_query(StateFilter(NewPlanStates.waiting_reminder), F.data.startswith("np_rem:"))
+async def process_reminder_button(callback: CallbackQuery, state: FSMContext, db: UserDB) -> None:
+    _, value = callback.data.split(":", 1)
+    minutes = 0 if value == "off" else int(value)
+    await callback.answer()
+    await _save_plan(callback.message, state, db, reminder_minutes=minutes)
 
 
 async def _save_plan(
-    message: Message, state: FSMContext, db: UserDB, description: str | None
+    message: Message, state: FSMContext, db: UserDB, reminder_minutes: int | None
 ) -> None:
     data = await state.get_data()
     plan_date = date.fromisoformat(data["plan_date"])
     title = data["title"]
     time_start = data.get("time_start")
     time_end = data.get("time_end")
+    description = data.get("description")
 
-    add_plan(db, plan_date, title, time_start, time_end, description)
+    add_plan(db, plan_date, title, time_start, time_end, description, reminder_minutes)
     await state.clear()
 
     time_label = time_start or "без времени"
@@ -149,6 +189,7 @@ async def _save_plan(
         f"📅 {format_date_full_ru(plan_date)} ({weekday_name(plan_date)})\n"
         f"🕐 {time_label}\n"
         f"📝 {title}\n"
-        f"💬 {description or 'Описание отсутствует'}\n\n"
+        f"💬 {description or 'Описание отсутствует'}\n"
+        f"{describe_reminder(reminder_minutes)}\n\n"
         "Посмотреть все планы на этот день можно командой /MyPlans"
     )

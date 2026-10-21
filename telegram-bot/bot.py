@@ -17,11 +17,13 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BotCommand
 
 from config import BOT_TOKEN
-from handlers import database_cmd, everyn, myplans, newplan, start
+from handlers import database_cmd, everyn, myplans, newplan, settings, start
 from middlewares.db_middleware import UserDBMiddleware
+from services.notifier import run_notifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,15 +33,27 @@ logger = logging.getLogger(__name__)
 
 
 async def set_bot_commands(bot: Bot) -> None:
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Начало работы с ботом"),
-            BotCommand(command="MyPlans", description="Посмотреть свои планы"),
-            BotCommand(command="NewPlan", description="Добавить новую задачу"),
-            BotCommand(command="everyN", description="Добавить повторяющуюся задачу"),
-            BotCommand(command="database", description="Получить файл базы данных"),
-        ]
-    )
+    # ВАЖНО: Telegram принимает в setMyCommands только команды из строчных
+    # латинских букв, цифр и "_" (без заглавных букв!). Раньше здесь стояли
+    # "MyPlans"/"NewPlan"/"everyN" с заглавными буквами, из-за чего Telegram
+    # отвечал ошибкой "Bad Request: BOT_COMMAND_INVALID" и бот падал ещё до
+    # запуска поллинга. Сами хендлеры по-прежнему понимают и "/NewPlan",
+    # и "/newplan" — это настраивается отдельно через aiogram Command(...).
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Начало работы с ботом"),
+                BotCommand(command="myplans", description="Посмотреть свои планы"),
+                BotCommand(command="newplan", description="Добавить новую задачу"),
+                BotCommand(command="everyn", description="Добавить повторяющуюся задачу"),
+                BotCommand(command="notify", description="Настроить уведомления"),
+                BotCommand(command="database", description="Получить файл базы данных"),
+            ]
+        )
+    except TelegramBadRequest:
+        # Не роняем бота, если Telegram вдруг откажет в обновлении меню команд —
+        # это не критично для работы самого бота.
+        logger.exception("Не удалось обновить список команд бота")
 
 
 async def main() -> None:
@@ -61,15 +75,21 @@ async def main() -> None:
     # универсальный обработчик текста (дат) — в самом конце, внутри myplans.
     dp.include_router(start.router)
     dp.include_router(database_cmd.router)
+    dp.include_router(settings.router)
     dp.include_router(newplan.router)
     dp.include_router(everyn.router)
     dp.include_router(myplans.router)
 
     await set_bot_commands(bot)
 
+    notifier_task = asyncio.create_task(run_notifier(bot))
+
     logger.info("Бот запускается...")
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        notifier_task.cancel()
 
 
 if __name__ == "__main__":
