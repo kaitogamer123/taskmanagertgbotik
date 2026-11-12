@@ -1,58 +1,44 @@
 """
 Тестовое (демонстрационное) расписание, которое автоматически
-добавляется в базу данных каждого нового пользователя,
-чтобы сразу было что посмотреть в /MyPlans.
+добавляется в базу данных каждого нового пользователя (с учётом его
+настроенного часового пояса), чтобы сразу было что посмотреть в /MyPlans.
 """
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
+from typing import Optional
+
+from utils.clock import now_local
 
 
-def _nearest_future_date(month: int, day: int, weekday: int) -> date:
+def seed_demo_data(conn: sqlite3.Connection, today: Optional[date] = None) -> None:
     """
-    Находит ближайший год, в котором `month`.`day` выпадает на
-    указанный день недели (weekday, 0=понедельник).
+    Наполняет свежесозданную базу тестовым расписанием на ближайшую неделю
+    относительно сегодняшнего дня пользователя `today`.
     """
-    year = date.today().year
-    for offset in range(0, 15):
-        candidate_year = year + offset
-        try:
-            candidate = date(candidate_year, month, day)
-        except ValueError:
-            continue
-        if candidate.weekday() == weekday and candidate >= date.today().replace(year=candidate_year) - candidate.resolution:
-            return candidate
-    # fallback - просто текущий год
-    return date(year, month, day)
-
-
-def seed_demo_data(conn: sqlite3.Connection) -> None:
-    """Наполняет свежесозданную базу тестовым расписанием пользователя."""
-
-    # Среда 21.10, Четверг 22.10, Пятница 23.10, Суббота 24.10, Воскресенье 25.10
-    # подбираем год, в котором 21.10 выпадает на среду, чтобы всё совпадало
-    wednesday = _nearest_future_date(10, 21, weekday=2)
-    thursday = wednesday.replace(day=22)
-    saturday = wednesday.replace(day=24)
-    sunday = wednesday.replace(day=25)
+    base = today or now_local().date()
+    day0 = base
+    day1 = base + timedelta(days=1)
+    # day2 (base + 2 дня) — специально без планов (пример свободного дня)
+    day3 = base + timedelta(days=3)
+    day4 = base + timedelta(days=4)
 
     rows = [
         # plan_date, time_start, time_end, title, description
-        (wednesday.isoformat(), "08:30", None, "сво", None),
-        (thursday.isoformat(), "08:00", "08:30", "сво", None),
-        (thursday.isoformat(), "08:30", "09:00", "математика", None),
-        (thursday.isoformat(), "14:10", "15:00", "Русский диктант", None),
-        # пятница 23.10 — специально без планов (пример свободного дня)
+        (day0.isoformat(), "08:30", None, "сво", None),
+        (day1.isoformat(), "08:00", "08:30", "сво", None),
+        (day1.isoformat(), "08:30", "09:00", "математика", None),
+        (day1.isoformat(), "14:10", "15:00", "Русский диктант", None),
         (
-            saturday.isoformat(),
+            day3.isoformat(),
             None,
             None,
             "Погулять со Славой если сможет + убрать пол+диван",
             None,
         ),
         (
-            sunday.isoformat(),
+            day4.isoformat(),
             None,
             None,
             "В понедельник проверочная по русскому",

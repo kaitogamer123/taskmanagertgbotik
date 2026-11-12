@@ -1,0 +1,29 @@
+# 1. Секреты и конфиги (чтобы не слить токены и локальные настройки при git pull)
+.env
+config_local.py
+
+# 2. Персональные базы данных пользователей (КРИТИЧНО! Чтобы git pull не затирал планы на сервере)
+PlanesUser/
+*.db
+*.sqlite3
+*.sqlite
+
+# 3. Виртуальное окружение Python
+venv/
+.venv/
+env/
+
+# 4. Временные файлы Python и кэш
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# 5. Папки IDE (PyCharm, VS Code)
+.idea/
+.vscode/
+
+# 6. Логи бота
+*.log
+logs/

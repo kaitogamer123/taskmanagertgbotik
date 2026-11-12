@@ -11,18 +11,31 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
 from pathlib import Path
 from typing import Iterator, Optional
 
-from config import DEFAULT_EVENING_TIME, DEFAULT_MORNING_TIME, PLANES_USER_DIR, USERNAME_RECHECK_INTERVAL
-from database.seed import seed_demo_data
+from config import (
+    DEFAULT_EVENING_TIME,
+    DEFAULT_MORNING_TIME,
+    PLANES_USER_DIR,
+    USERNAME_RECHECK_INTERVAL,
+)
 
 INDEX_FILE = PLANES_USER_DIR / "_index.json"
 
 _SAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_\-.а-яА-ЯёЁ]")
+
+# Кэш _index.json: раньше файл читался с диска на каждое сообщение/кнопку
+# и на каждый тик планировщика, теперь читаем только при его изменении.
+_INDEX_CACHE: dict | None = None
+_INDEX_MTIME: float | None = None
+
+# Схема/миграции каждой базы выполняются один раз за запуск процесса.
+_SCHEMA_READY: set = set()
 
 
 def _safe_filename_part(value: str) -> str:
@@ -32,18 +45,45 @@ def _safe_filename_part(value: str) -> str:
 
 
 def _load_index() -> dict:
-    if INDEX_FILE.exists():
-        try:
-            return json.loads(INDEX_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+    global _INDEX_CACHE, _INDEX_MTIME
+
+    try:
+        mtime = INDEX_FILE.stat().st_mtime
+    except OSError:
+        _INDEX_CACHE = {}
+        _INDEX_MTIME = None
+        return _INDEX_CACHE
+
+    if _INDEX_CACHE is not None and _INDEX_MTIME == mtime:
+        return _INDEX_CACHE
+
+    try:
+        data = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (json.JSONDecodeError, OSError):
+        # При битом файле не теряем ранее загруженный индекс
+        data = _INDEX_CACHE or {}
+
+    _INDEX_CACHE = data
+    _INDEX_MTIME = mtime
+    return data
 
 
 def _save_index(data: dict) -> None:
-    INDEX_FILE.write_text(
+    global _INDEX_CACHE, _INDEX_MTIME
+
+    tmp_path = INDEX_FILE.with_name(INDEX_FILE.name + ".tmp")
+    tmp_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    # Атомарная замена: файл индекса не побьётся при падении/перезапуске
+    os.replace(tmp_path, INDEX_FILE)
+    _INDEX_CACHE = data
+    try:
+        _INDEX_MTIME = INDEX_FILE.stat().st_mtime
+    except OSError:
+        _INDEX_MTIME = None
 
 
 def _expected_filename(telegram_id: int, username: Optional[str]) -> str:
@@ -51,7 +91,12 @@ def _expected_filename(telegram_id: int, username: Optional[str]) -> str:
     return f"{_safe_filename_part(base)}.db"
 
 
-def _create_schema(conn: sqlite3.Connection) -> None:
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> None:
+    had_demo_col_before = "demo_seeded" in _table_columns(conn, "user_settings")
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS user_meta (
@@ -84,7 +129,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             rule_value TEXT NOT NULL,
             created_at TEXT,
             reminder_minutes INTEGER,
-            last_reminder_date TEXT
+            last_reminder_date TEXT,
+            excluded_dates TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS user_settings (
@@ -94,31 +140,63 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             evening_enabled INTEGER NOT NULL DEFAULT 1,
             evening_time TEXT NOT NULL DEFAULT '20:00',
             last_morning_sent TEXT,
-            last_evening_sent TEXT
+            last_evening_sent TEXT,
+            utc_offset INTEGER,
+            timezone_configured INTEGER NOT NULL DEFAULT 0,
+            demo_seeded INTEGER NOT NULL DEFAULT 0
         );
         """
     )
     conn.commit()
-    _migrate_schema(conn)
+    _migrate_schema(
+        conn,
+        is_existing_file=is_existing_file,
+        had_demo_col_before=had_demo_col_before,
+    )
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-
-
-def _migrate_schema(conn: sqlite3.Connection) -> None:
-    """Добавляет новые колонки в базы, созданные до появления напоминаний."""
+def _migrate_schema(
+    conn: sqlite3.Connection,
+    is_existing_file: bool = False,
+    had_demo_col_before: bool = False,
+) -> None:
+    """Автоматически добавляет недостающие колонки в уже существующие базы пользователей."""
     plans_cols = _table_columns(conn, "plans")
     if "reminder_minutes" not in plans_cols:
         conn.execute("ALTER TABLE plans ADD COLUMN reminder_minutes INTEGER")
     if "reminder_sent" not in plans_cols:
-        conn.execute("ALTER TABLE plans ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "ALTER TABLE plans ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0"
+        )
 
     rules_cols = _table_columns(conn, "recurring_rules")
     if "reminder_minutes" not in rules_cols:
         conn.execute("ALTER TABLE recurring_rules ADD COLUMN reminder_minutes INTEGER")
     if "last_reminder_date" not in rules_cols:
         conn.execute("ALTER TABLE recurring_rules ADD COLUMN last_reminder_date TEXT")
+    if "excluded_dates" not in rules_cols:
+        conn.execute(
+            "ALTER TABLE recurring_rules ADD COLUMN excluded_dates TEXT NOT NULL DEFAULT ''"
+        )
+
+    settings_cols = _table_columns(conn, "user_settings")
+    if "utc_offset" not in settings_cols:
+        conn.execute("ALTER TABLE user_settings ADD COLUMN utc_offset INTEGER")
+    if "timezone_configured" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE user_settings ADD COLUMN timezone_configured INTEGER NOT NULL DEFAULT 0"
+        )
+    if "demo_seeded" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE user_settings ADD COLUMN demo_seeded INTEGER NOT NULL DEFAULT 0"
+        )
+
+    # Индексы заметно ускоряют планировщик уведомлений и выборку планов по дню
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_plans_date ON plans(plan_date)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plans_reminder "
+        "ON plans(reminder_sent, reminder_minutes)"
+    )
 
     conn.execute(
         """
@@ -127,6 +205,11 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         """,
         (DEFAULT_MORNING_TIME, DEFAULT_EVENING_TIME),
     )
+
+    # Если база была создана старой версией бота — не подмешиваем демо-данные поверх планов юзера
+    if is_existing_file and not had_demo_col_before:
+        conn.execute("UPDATE user_settings SET demo_seeded = 1 WHERE id = 1")
+
     conn.commit()
 
 
@@ -135,8 +218,14 @@ class UserDB:
 
     def __init__(self, path: Path):
         self.path = path
-        self.conn = sqlite3.connect(path)
+        # timeout/busy_timeout защищают от "database is locked", если базу
+        # в этот момент читает/пишет другая часть бота.
+        self.conn = sqlite3.connect(path, timeout=10)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        # NORMAL вместо FULL: меньше fsync на каждый commit. Данные при сбое
+        # не портятся, может потеряться только самая последняя транзакция.
+        self.conn.execute("PRAGMA synchronous = NORMAL")
 
     def close(self) -> None:
         self.conn.close()
@@ -160,6 +249,22 @@ def get_db_path(telegram_id: int, username: Optional[str] = None) -> Path:
     return PLANES_USER_DIR / filename
 
 
+def _ensure_schema(db: UserDB, is_existing_file: bool, force: bool = False) -> None:
+    """
+    Выполняет CREATE TABLE / миграции только ОДИН раз за запуск процесса
+    для каждого файла БД. Раньше схема пересоздавалась на каждое сообщение,
+    на каждую кнопку и на каждый тик планировщика — это давало постоянные
+    записи на диск и лишнюю нагрузку на CPU.
+
+    force=True нужен, если файл БД только что создан заново (например, его
+    удалили с сервера) — тогда схему надо накатить, несмотря на кэш.
+    """
+    if not force and db.path in _SCHEMA_READY:
+        return
+    _create_schema(db.conn, is_existing_file=is_existing_file)
+    _SCHEMA_READY.add(db.path)
+
+
 def ensure_user_db(
     telegram_id: int, username: Optional[str], first_name: Optional[str]
 ) -> UserDB:
@@ -168,9 +273,10 @@ def ensure_user_db(
     is_new = not path.exists()
 
     db = UserDB(path)
-    _create_schema(db.conn)
+    _ensure_schema(db, is_existing_file=not is_new, force=is_new)
 
-    if is_new:
+    row = db.conn.execute("SELECT telegram_id FROM user_meta LIMIT 1").fetchone()
+    if row is None:
         db.conn.execute(
             """
             INSERT INTO user_meta (telegram_id, username, first_name, created_at, last_checked)
@@ -179,20 +285,6 @@ def ensure_user_db(
             (telegram_id, username, first_name, time.time()),
         )
         db.conn.commit()
-        seed_demo_data(db.conn)
-    else:
-        row = db.conn.execute(
-            "SELECT telegram_id FROM user_meta LIMIT 1"
-        ).fetchone()
-        if row is None:
-            db.conn.execute(
-                """
-                INSERT INTO user_meta (telegram_id, username, first_name, created_at, last_checked)
-                VALUES (?, ?, ?, datetime('now'), ?)
-                """,
-                (telegram_id, username, first_name, time.time()),
-            )
-            db.conn.commit()
 
     return db
 
@@ -203,8 +295,6 @@ def maybe_refresh_username(
     """
     Проверяет (не чаще раза в 5 минут), не изменился ли username пользователя.
     Если изменился — переименовывает файл базы данных и обновляет индекс.
-    Возвращает (возможно новый) объект UserDB, т.к. при переименовании файла
-    соединение нужно переоткрыть.
     """
     row = db.conn.execute(
         "SELECT username, first_name, last_checked FROM user_meta WHERE telegram_id = ?",
@@ -238,7 +328,6 @@ def maybe_refresh_username(
         db.conn.commit()
         return db
 
-    # username поменялся -> переименовываем файл базы данных
     old_path = db.path
     new_filename = _expected_filename(telegram_id, username)
     new_path = old_path.parent / new_filename
@@ -278,8 +367,7 @@ def iter_all_user_ids() -> Iterator[int]:
 def open_user_db_by_id(telegram_id: int) -> Optional[UserDB]:
     """
     Открывает базу данных пользователя по его telegram_id без создания новой
-    (используется фоновым планировщиком уведомлений). Возвращает None, если
-    пользователь ещё никогда не писал боту.
+    (используется фоновым планировщиком уведомлений).
     """
     index = _load_index()
     filename = index.get(str(telegram_id))
@@ -289,5 +377,5 @@ def open_user_db_by_id(telegram_id: int) -> Optional[UserDB]:
     if not path.exists():
         return None
     db = UserDB(path)
-    _create_schema(db.conn)
+    _ensure_schema(db, is_existing_file=True)
     return db

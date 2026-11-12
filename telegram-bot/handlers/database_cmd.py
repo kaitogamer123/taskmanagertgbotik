@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from aiogram import Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import FSInputFile, Message
 
 from database.db_manager import UserDB
@@ -9,8 +10,9 @@ from database.db_manager import UserDB
 router = Router(name="database_cmd")
 
 
-@router.message(Command("database"))
-async def cmd_database(message: Message, db: UserDB) -> None:
+@router.message(Command("database", ignore_case=True))
+async def cmd_database(message: Message, state: FSMContext, db: UserDB) -> None:
+    await state.clear()
     file = FSInputFile(db.path, filename=db.path.name)
     await message.answer_document(
         file,

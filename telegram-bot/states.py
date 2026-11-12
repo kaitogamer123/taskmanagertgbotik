@@ -3,6 +3,10 @@ from __future__ import annotations
 from aiogram.fsm.state import State, StatesGroup
 
 
+class TimezoneStates(StatesGroup):
+    waiting_hour = State()
+
+
 class NewPlanStates(StatesGroup):
     waiting_date = State()
     waiting_time_start = State()

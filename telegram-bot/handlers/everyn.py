@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from datetime import date
 
 from aiogram import F, Router
@@ -10,31 +11,47 @@ from aiogram.types import CallbackQuery, Message
 from database.db_manager import UserDB
 from database.plans_repo import add_recurring_rule
 from keyboards.inline import (
+    cancel_inline_keyboard,
     every_n_type_keyboard,
     reminder_choice_keyboard,
     skip_keyboard,
     weekday_multiselect_keyboard,
 )
+from keyboards.reply import BTN_EVERY_N, MAIN_MENU_BUTTONS, main_reply_keyboard
 from states import EveryNStates
-from utils.date_utils import format_date_full_ru, parse_natural_date, parse_time, weekday_name
+from utils.clock import today_for_user
+from utils.date_utils import (
+    format_date_full_ru,
+    is_skip_time_phrase,
+    parse_natural_date,
+    parse_time,
+    weekday_name,
+)
 from utils.reminder_utils import describe_reminder, parse_reminder_offset
 from utils.repeat_parser import describe_rule, parse_repeat_phrase
 
 router = Router(name="everyn")
 
 
-@router.message(Command("everyN", "everyn"))
+@router.message(Command("everyN", "everyn", ignore_case=True))
+@router.message(F.text == BTN_EVERY_N)
 async def cmd_every_n(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await state.set_state(EveryNStates.waiting_title)
     await message.answer(
         "Добавляем повторяющуюся задачу 🔁\n\n"
         "Напиши название задачи. Если хочешь добавить и описание — "
         "укажи его через вертикальную черту, например:\n"
-        "«Пить витамины | Утром после завтрака»"
+        "<code>Пить витамины | Утром после завтрака</code>",
+        reply_markup=cancel_inline_keyboard(),
     )
 
 
-@router.message(StateFilter(EveryNStates.waiting_title))
+@router.message(
+    StateFilter(EveryNStates.waiting_title),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
 async def process_title(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     if not raw:
@@ -46,26 +63,51 @@ async def process_title(message: Message, state: FSMContext) -> None:
     else:
         title, description = raw, None
 
+    if not title:
+        await message.answer("Название не может быть пустым, напиши ещё раз.")
+        return
+
     await state.update_data(title=title, description=description)
     await state.set_state(EveryNStates.waiting_time_start)
     await message.answer(
-        "Во сколько должна начинаться задача? Напиши время (например 09:00) "
-        "или нажми «без времени».",
+        "Во сколько должна начинаться задача? Напиши время (например <code>09:00</code>) "
+        "или нажми «Без конкретного времени».",
         reply_markup=skip_keyboard("en_skip_start", "Без конкретного времени"),
     )
 
 
-@router.message(StateFilter(EveryNStates.waiting_time_start))
+@router.message(
+    StateFilter(EveryNStates.waiting_time_start),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
 async def process_time_start(message: Message, state: FSMContext) -> None:
-    await state.update_data(time_start=parse_time(message.text or ""))
+    raw = message.text or ""
+    if is_skip_time_phrase(raw):
+        await state.update_data(time_start=None)
+        await _ask_time_end(message, state)
+        return
+
+    parsed = parse_time(raw)
+    if parsed is None:
+        await message.answer(
+            "Не понял время 🙈 Напиши в формате ЧЧ:ММ (например <code>09:00</code>) "
+            "или нажми кнопку «Без конкретного времени»."
+        )
+        return
+
+    await state.update_data(time_start=parsed)
     await _ask_time_end(message, state)
 
 
-@router.callback_query(StateFilter(EveryNStates.waiting_time_start), F.data == "en_skip_start")
+@router.callback_query(
+    StateFilter(EveryNStates.waiting_time_start), F.data == "en_skip_start"
+)
 async def skip_time_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(time_start=None)
     await callback.answer()
-    await _ask_time_end(callback.message, state)
+    if callback.message:
+        await _ask_time_end(callback.message, state)
 
 
 async def _ask_time_end(message: Message, state: FSMContext) -> None:
@@ -76,17 +118,38 @@ async def _ask_time_end(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(StateFilter(EveryNStates.waiting_time_end))
+@router.message(
+    StateFilter(EveryNStates.waiting_time_end),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
 async def process_time_end(message: Message, state: FSMContext) -> None:
-    await state.update_data(time_end=parse_time(message.text or ""))
+    raw = message.text or ""
+    if is_skip_time_phrase(raw):
+        await state.update_data(time_end=None)
+        await _ask_repeat_type(message, state)
+        return
+
+    parsed = parse_time(raw)
+    if parsed is None:
+        await message.answer(
+            "Не понял время окончания 🙈 Напиши в формате ЧЧ:ММ "
+            "или нажми кнопку «Без окончания»."
+        )
+        return
+
+    await state.update_data(time_end=parsed)
     await _ask_repeat_type(message, state)
 
 
-@router.callback_query(StateFilter(EveryNStates.waiting_time_end), F.data == "en_skip_end")
+@router.callback_query(
+    StateFilter(EveryNStates.waiting_time_end), F.data == "en_skip_end"
+)
 async def skip_time_end(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(time_end=None)
     await callback.answer()
-    await _ask_repeat_type(callback.message, state)
+    if callback.message:
+        await _ask_repeat_type(callback.message, state)
 
 
 async def _ask_repeat_type(message: Message, state: FSMContext) -> None:
@@ -103,7 +166,11 @@ async def _ask_repeat_type(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(StateFilter(EveryNStates.waiting_repeat_type))
+@router.message(
+    StateFilter(EveryNStates.waiting_repeat_type),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
 async def process_repeat_text(message: Message, state: FSMContext) -> None:
     result = parse_repeat_phrase(message.text or "")
     if result is None:
@@ -112,7 +179,7 @@ async def process_repeat_text(message: Message, state: FSMContext) -> None:
         )
         return
 
-    if result.is_complete():
+    if result.is_complete() and result.rule_value is not None:
         await _ask_start_date(message, state, result.rule_type, result.rule_value)
         return
 
@@ -121,19 +188,30 @@ async def process_repeat_text(message: Message, state: FSMContext) -> None:
         await message.answer("Какого числа каждый месяц? Напиши число от 1 до 31.")
     elif result.rule_type == "yearly":
         await state.set_state(EveryNStates.waiting_yearly_value)
-        await message.answer("Какого числа и месяца каждый год? Например: 1 января или 01.01.")
+        await message.answer(
+            "Какого числа и месяца каждый год? Например: <code>1 января</code> или <code>01.01</code>."
+        )
 
 
-@router.callback_query(StateFilter(EveryNStates.waiting_repeat_type), F.data.startswith("everyn_type:"))
-async def process_repeat_button(callback: CallbackQuery, state: FSMContext) -> None:
-    _, rtype = callback.data.split(":", 1)
+@router.callback_query(
+    StateFilter(EveryNStates.waiting_repeat_type), F.data.startswith("everyn_type:")
+)
+async def process_repeat_button(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    _, rtype = (callback.data or "").split(":", 1)
     await callback.answer()
+    if not callback.message:
+        return
 
     if rtype == "daily":
         await _ask_start_date(callback.message, state, "interval", "1")
     elif rtype == "interval":
         await state.set_state(EveryNStates.waiting_interval_value)
-        await callback.message.answer("Через сколько дней повторять? Напиши число, например 3.")
+        await callback.message.answer(
+            "Через сколько дней повторять? Напиши число, например <code>3</code>.",
+            reply_markup=cancel_inline_keyboard(),
+        )
     elif rtype == "weekday":
         await state.update_data(selected_weekdays=[])
         await state.set_state(EveryNStates.waiting_weekday_select)
@@ -143,24 +221,38 @@ async def process_repeat_button(callback: CallbackQuery, state: FSMContext) -> N
         )
     elif rtype == "monthly":
         await state.set_state(EveryNStates.waiting_monthly_value)
-        await callback.message.answer("Какого числа каждый месяц? Напиши число от 1 до 31.")
+        await callback.message.answer(
+            "Какого числа каждый месяц? Напиши число от 1 до 31.",
+            reply_markup=cancel_inline_keyboard(),
+        )
     elif rtype == "yearly":
         await state.set_state(EveryNStates.waiting_yearly_value)
-        await callback.message.answer("Какого числа и месяца каждый год? Например: 1 января или 01.01.")
+        await callback.message.answer(
+            "Какого числа и месяца каждый год? Например: <code>1 января</code> или <code>01.01</code>.",
+            reply_markup=cancel_inline_keyboard(),
+        )
 
 
-@router.message(StateFilter(EveryNStates.waiting_interval_value))
+@router.message(
+    StateFilter(EveryNStates.waiting_interval_value),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
 async def process_interval_value(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if not text.isdigit() or int(text) <= 0:
-        await message.answer("Нужно целое положительное число дней, например 3. Попробуй ещё раз.")
+        await message.answer(
+            "Нужно целое положительное число дней, например <code>3</code>. Попробуй ещё раз."
+        )
         return
     await _ask_start_date(message, state, "interval", text)
 
 
-@router.callback_query(StateFilter(EveryNStates.waiting_weekday_select), F.data.startswith("wd_toggle:"))
+@router.callback_query(
+    StateFilter(EveryNStates.waiting_weekday_select), F.data.startswith("wd_toggle:")
+)
 async def toggle_weekday(callback: CallbackQuery, state: FSMContext) -> None:
-    _, idx_str = callback.data.split(":", 1)
+    _, idx_str = (callback.data or "").split(":", 1)
     idx = int(idx_str)
     data = await state.get_data()
     selected = set(data.get("selected_weekdays", []))
@@ -169,15 +261,22 @@ async def toggle_weekday(callback: CallbackQuery, state: FSMContext) -> None:
     else:
         selected.add(idx)
     await state.update_data(selected_weekdays=list(selected))
-    await callback.message.edit_reply_markup(reply_markup=weekday_multiselect_keyboard(selected))
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=weekday_multiselect_keyboard(selected)
+        )
     await callback.answer()
 
 
-@router.callback_query(StateFilter(EveryNStates.waiting_weekday_select), F.data == "wd_done")
+@router.callback_query(
+    StateFilter(EveryNStates.waiting_weekday_select), F.data == "wd_done"
+)
 async def finish_weekday_select(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     selected = sorted(set(data.get("selected_weekdays", [])))
     await callback.answer()
+    if not callback.message:
+        return
     if not selected:
         await callback.message.answer("Выбери хотя бы один день недели.")
         return
@@ -185,7 +284,11 @@ async def finish_weekday_select(callback: CallbackQuery, state: FSMContext) -> N
     await _ask_start_date(callback.message, state, "weekday", value)
 
 
-@router.message(StateFilter(EveryNStates.waiting_monthly_value))
+@router.message(
+    StateFilter(EveryNStates.waiting_monthly_value),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
 async def process_monthly_value(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if not text.isdigit() or not (1 <= int(text) <= 31):
@@ -194,38 +297,63 @@ async def process_monthly_value(message: Message, state: FSMContext) -> None:
     await _ask_start_date(message, state, "monthly", text)
 
 
-@router.message(StateFilter(EveryNStates.waiting_yearly_value))
-async def process_yearly_value(message: Message, state: FSMContext) -> None:
-    parsed = parse_natural_date(message.text or "")
+@router.message(
+    StateFilter(EveryNStates.waiting_yearly_value),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
+async def process_yearly_value(
+    message: Message, state: FSMContext, db: UserDB
+) -> None:
+    parsed = parse_natural_date(message.text or "", today=today_for_user(db))
     if parsed is None:
-        await message.answer("Не понял дату. Напиши, например: 1 января или 01.01.")
+        await message.answer(
+            "Не понял дату. Напиши, например: <code>1 января</code> или <code>01.01</code>."
+        )
         return
     await _ask_start_date(message, state, "yearly", f"{parsed.day}-{parsed.month}")
 
 
-async def _ask_start_date(message: Message, state: FSMContext, rule_type: str, rule_value: str) -> None:
+async def _ask_start_date(
+    message: Message, state: FSMContext, rule_type: str, rule_value: str
+) -> None:
     await state.update_data(rule_type=rule_type, rule_value=rule_value)
     await state.set_state(EveryNStates.waiting_start_date)
     await message.answer(
-        f"Периодичность: {describe_rule(rule_type, rule_value)}.\n\n"
+        f"🔁 Периодичность: <b>{html.escape(describe_rule(rule_type, rule_value))}</b>.\n\n"
         "С какой даты начать повторять задачу? Напиши дату или нажми «Сегодня».",
         reply_markup=skip_keyboard("en_start_today", "Сегодня"),
     )
 
 
-@router.message(StateFilter(EveryNStates.waiting_start_date))
-async def process_start_date(message: Message, state: FSMContext, db: UserDB) -> None:
-    parsed = parse_natural_date(message.text or "")
+@router.message(
+    StateFilter(EveryNStates.waiting_start_date),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
+async def process_start_date(
+    message: Message, state: FSMContext, db: UserDB
+) -> None:
+    parsed = parse_natural_date(message.text or "", today=today_for_user(db))
     if parsed is None:
-        await message.answer("Не понял дату, попробуй ещё раз, например 19.10 или «завтра».")
+        await message.answer(
+            "Не понял дату, попробуй ещё раз, например <code>19.10</code> или «завтра»."
+        )
         return
     await _ask_reminder_or_save(message, state, db, parsed)
 
 
-@router.callback_query(StateFilter(EveryNStates.waiting_start_date), F.data == "en_start_today")
-async def start_date_today(callback: CallbackQuery, state: FSMContext, db: UserDB) -> None:
+@router.callback_query(
+    StateFilter(EveryNStates.waiting_start_date), F.data == "en_start_today"
+)
+async def start_date_today(
+    callback: CallbackQuery, state: FSMContext, db: UserDB
+) -> None:
     await callback.answer()
-    await _ask_reminder_or_save(callback.message, state, db, date.today())
+    if callback.message:
+        await _ask_reminder_or_save(
+            callback.message, state, db, today_for_user(db)
+        )
 
 
 async def _ask_reminder_or_save(
@@ -245,8 +373,14 @@ async def _ask_reminder_or_save(
     )
 
 
-@router.message(StateFilter(EveryNStates.waiting_reminder))
-async def process_reminder_text(message: Message, state: FSMContext, db: UserDB) -> None:
+@router.message(
+    StateFilter(EveryNStates.waiting_reminder),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
+async def process_reminder_text(
+    message: Message, state: FSMContext, db: UserDB
+) -> None:
     minutes = parse_reminder_offset(message.text or "")
     if minutes is None:
         await message.answer(
@@ -257,12 +391,17 @@ async def process_reminder_text(message: Message, state: FSMContext, db: UserDB)
     await _save_rule(message, state, db, reminder_minutes=minutes)
 
 
-@router.callback_query(StateFilter(EveryNStates.waiting_reminder), F.data.startswith("en_rem:"))
-async def process_reminder_button(callback: CallbackQuery, state: FSMContext, db: UserDB) -> None:
-    _, value = callback.data.split(":", 1)
+@router.callback_query(
+    StateFilter(EveryNStates.waiting_reminder), F.data.startswith("en_rem:")
+)
+async def process_reminder_button(
+    callback: CallbackQuery, state: FSMContext, db: UserDB
+) -> None:
+    _, value = (callback.data or "").split(":", 1)
     minutes = 0 if value == "off" else int(value)
     await callback.answer()
-    await _save_rule(callback.message, state, db, reminder_minutes=minutes)
+    if callback.message:
+        await _save_rule(callback.message, state, db, reminder_minutes=minutes)
 
 
 async def _save_rule(
@@ -296,11 +435,12 @@ async def _save_rule(
 
     await message.answer(
         "Готово! ✅ Повторяющаяся задача добавлена:\n\n"
-        f"📝 {title}\n"
-        f"💬 {description or 'Описание отсутствует'}\n"
-        f"🕐 {time_label}\n"
-        f"🔁 {describe_rule(rule_type, rule_value)}\n"
+        f"📝 <b>{html.escape(title)}</b>\n"
+        f"💬 {html.escape(description) if description else 'Описание отсутствует'}\n"
+        f"🕐 {html.escape(time_label)}\n"
+        f"🔁 {html.escape(describe_rule(rule_type, rule_value))}\n"
         f"📅 Начиная с {format_date_full_ru(start_date)} ({weekday_name(start_date)})\n"
         f"{describe_reminder(reminder_minutes)}\n\n"
-        "Посмотреть планы можно командой /MyPlans"
+        "Посмотреть планы можно кнопкой «📅 Мои планы» или «📋 Дни с задачами».",
+        reply_markup=main_reply_keyboard(),
     )

@@ -14,6 +14,8 @@ import re
 from datetime import date, timedelta
 from typing import Optional
 
+from utils.clock import now_local
+
 RU_WEEKDAYS = [
     "понедельник",
     "вторник",
@@ -74,7 +76,7 @@ def parse_natural_date(text: str, today: Optional[date] = None) -> Optional[date
     Возвращает date или None, если распознать не удалось.
     """
     if today is None:
-        today = date.today()
+        today = now_local().date()
 
     raw = text.strip().lower()
     raw = raw.replace("ё", "е")
@@ -160,8 +162,6 @@ def parse_natural_date(text: str, today: Optional[date] = None) -> Optional[date
             monday_next_week = monday_this_week + timedelta(days=7)
             return monday_next_week + timedelta(days=weekday_idx)
 
-        # ближайшее наступление этого дня недели (сегодня считается, если
-        # явно не указано "следующий")
         days_ahead = (weekday_idx - today.weekday()) % 7
         if this_week and days_ahead == 0:
             days_ahead = 0
@@ -170,29 +170,39 @@ def parse_natural_date(text: str, today: Optional[date] = None) -> Optional[date
     return None
 
 
-TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.\-]([0-5]\d)\b")
+TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*[:.\-\s]\s*([0-5]\d)(?!\d)")
+
+_NO_TIME_MARKERS = (
+    "без врем",
+    "без оконч",
+    "без начала",
+    "без конкретн",
+    "не знаю",
+    "неизвестно",
+    "пропустить",
+)
+
+
+def is_skip_time_phrase(text: str) -> bool:
+    """Проверяет, написал ли пользователь явно, что времени нет / нужно пропустить."""
+    raw = (text or "").strip().lower().replace("ё", "е")
+    if raw in {"нет", "-", "не надо"}:
+        return True
+    return any(marker in raw for marker in _NO_TIME_MARKERS)
 
 
 def parse_time(text: str) -> Optional[str]:
     """Вытаскивает время HH:MM из текста. Возвращает строку '14:30' или None."""
-    raw = text.strip().lower()
-    no_time_markers = (
-        "без врем",
-        "без оконч",
-        "без начала",
-        "не знаю",
-        "неизвестно",
-        "пропустить",
-    )
-    if raw == "нет" or raw == "-" or any(marker in raw for marker in no_time_markers):
+    raw = (text or "").strip().lower().replace("ё", "е")
+    if not raw or is_skip_time_phrase(raw):
         return None
     m = TIME_RE.search(raw)
     if m:
         hour = int(m.group(1))
         minute = int(m.group(2))
         return f"{hour:02d}:{minute:02d}"
-    # просто одно-два числа "9" / "14" -> считаем часом
-    m2 = re.fullmatch(r"(\d{1,2})\s*(?:ч|час|часов)?", raw)
+    # "9" / "14" / "в 14" / "9ч" / "14 часов" -> считаем часом
+    m2 = re.fullmatch(r"(?:в\s+)?(\d{1,2})\s*(?:ч|час|часа|часов)?", raw)
     if m2:
         hour = int(m2.group(1))
         if 0 <= hour <= 23:

@@ -29,8 +29,6 @@ def parse_reminder_offset(text: str) -> Optional[int]:
         0    — если пользователь явно попросил не напоминать;
         int  — количество минут до задачи;
         None — если не удалось распознать фразу.
-    Примеры: "15 минут", "30 мин", "1 час", "2 часа", "за час", "1.5 часа",
-    "90", "день", "1 день".
     """
     raw = text.strip().lower().replace("ё", "е")
     if not raw:
@@ -60,7 +58,7 @@ def parse_reminder_offset(text: str) -> Optional[int]:
     # просто "час" / "полчаса"
     if "полчаса" in raw:
         return 30
-    if re.fullmatch(r"час", raw):
+    if re.fullmatch(r"(?:за\s+)?час", raw):
         return 60
     if "день" in raw or "сутки" in raw:
         return 24 * 60
@@ -108,5 +106,5 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
 
 def describe_reminder(minutes: Optional[int]) -> str:
     if not minutes:
-        return "Напоминание выключено"
-    return f"Напомню за {format_minutes_label(minutes)} до начала"
+        return "🔕 Напоминание выключено"
+    return f"⏰ Напомню за {format_minutes_label(minutes)} до начала"

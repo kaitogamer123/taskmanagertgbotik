@@ -44,7 +44,7 @@ def parse_repeat_phrase(text: str) -> Optional[RepeatParseResult]:
 
     # каждые N дней
     m = re.search(r"кажд\w*\s*(\d+)\s*дн", raw)
-    if m:
+    if m and int(m.group(1)) > 0:
         return RepeatParseResult("interval", m.group(1))
 
     # дни недели (одиночные или множественные упоминания)
@@ -67,7 +67,7 @@ def parse_repeat_phrase(text: str) -> Optional[RepeatParseResult]:
 
     # каждое N число
     m = re.search(r"кажд\w*\s*(\d{1,2})\s*числ", raw)
-    if m:
+    if m and 1 <= int(m.group(1)) <= 31:
         return RepeatParseResult("monthly", m.group(1))
 
     # ежегодно / каждый год
@@ -75,12 +75,15 @@ def parse_repeat_phrase(text: str) -> Optional[RepeatParseResult]:
         tail = raw.split("год", 1)[-1]
         m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})\b", tail)
         if m:
-            return RepeatParseResult("yearly", f"{int(m.group(1))}-{int(m.group(2))}")
+            day_, month_ = int(m.group(1)), int(m.group(2))
+            if 1 <= month_ <= 12 and 1 <= day_ <= 31:
+                return RepeatParseResult("yearly", f"{day_}-{month_}")
         m = re.search(r"\b(\d{1,2})\s+(" + "|".join(MONTHS_RU.keys()) + r")\b", tail)
         if m:
             day = int(m.group(1))
             month = MONTHS_RU[m.group(2)]
-            return RepeatParseResult("yearly", f"{day}-{month}")
+            if 1 <= day <= 31:
+                return RepeatParseResult("yearly", f"{day}-{month}")
         return RepeatParseResult("yearly", None)
 
     return None
@@ -93,7 +96,7 @@ def describe_rule(rule_type: str, rule_value: str) -> str:
         n = int(rule_value)
         return "каждый день" if n == 1 else f"каждые {n} дн."
     if rule_type == "weekday":
-        names = [RU_WEEKDAYS[int(i)].capitalize() for i in rule_value.split(",")]
+        names = [RU_WEEKDAYS[int(i)].capitalize() for i in rule_value.split(",") if i != ""]
         return "по дням: " + ", ".join(names)
     if rule_type == "monthly":
         return f"каждый месяц, {rule_value} числа"

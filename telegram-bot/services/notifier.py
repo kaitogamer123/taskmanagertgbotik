@@ -2,7 +2,7 @@
 Фоновый планировщик уведомлений.
 
 Каждые config.NOTIFIER_POLL_INTERVAL секунд проверяет базы данных всех
-пользователей и:
+пользователей с учётом ИНДИВИДУАЛЬНОГО часового пояса каждого пользователя и:
   1) отправляет утреннюю сводку (планы на сегодня) в настроенное время;
   2) отправляет вечернюю сводку (планы на завтра) в настроенное время;
   3) отправляет напоминания "через N у тебя задача ..." для разовых и
@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -21,16 +23,20 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramNotFound
 from config import NOTIFIER_POLL_INTERVAL
 from database.db_manager import UserDB, iter_all_user_ids, open_user_db_by_id
 from database.plans_repo import PlanItem, _rule_occurs_on, get_plans_for_date
-from database.settings_repo import get_settings, mark_evening_sent, mark_morning_sent
-from utils.clock import now_local
+from database.settings_repo import (
+    NotifySettings,
+    get_settings,
+    mark_evening_sent,
+    mark_morning_sent,
+)
+from utils.clock import now_for_offset
 from utils.date_utils import format_date_full_ru, weekday_name
 from utils.reminder_utils import format_minutes_label
 
 logger = logging.getLogger(__name__)
 
 # Если бот был недоступен дольше этого времени, старые просроченные
-# напоминания/сводки уже не досылаем, чтобы не "накрыть" пользователя
-# устаревшими сообщениями после долгого простоя.
+# напоминания/сводки уже не досылаем.
 GRACE_WINDOW = timedelta(minutes=15)
 
 
@@ -39,7 +45,7 @@ def _digest_body(items: list[PlanItem]) -> str:
         return "На этот день пока ничего не запланировано 🙂"
     lines = []
     for item in items:
-        lines.append(f"🕐 {item.time_label()} — {item.title}")
+        lines.append(f"🕐 {html.escape(item.time_label())} — {html.escape(item.title)}")
     return "\n".join(lines)
 
 
@@ -47,7 +53,7 @@ async def _send_morning_digest(bot: Bot, telegram_id: int, db: UserDB, today: da
     items = get_plans_for_date(db, today)
     text = (
         f"🌅 Доброе утро! Вот что запланировано на сегодня, "
-        f"{format_date_full_ru(today)} ({weekday_name(today)}):\n\n"
+        f"<b>{format_date_full_ru(today)} ({weekday_name(today)})</b>:\n\n"
         f"{_digest_body(items)}"
     )
     await bot.send_message(telegram_id, text)
@@ -57,7 +63,7 @@ async def _send_evening_digest(bot: Bot, telegram_id: int, db: UserDB, tomorrow:
     items = get_plans_for_date(db, tomorrow)
     text = (
         f"🌙 Добрый вечер! Вот что запланировано на завтра, "
-        f"{format_date_full_ru(tomorrow)} ({weekday_name(tomorrow)}):\n\n"
+        f"<b>{format_date_full_ru(tomorrow)} ({weekday_name(tomorrow)})</b>:\n\n"
         f"{_digest_body(items)}"
     )
     await bot.send_message(telegram_id, text)
@@ -71,8 +77,13 @@ def _parse_hhmm(value: str) -> Optional[tuple[int, int]]:
         return None
 
 
-async def _check_daily_digests(bot: Bot, telegram_id: int, db: UserDB, now: datetime) -> None:
-    settings = get_settings(db)
+async def _check_daily_digests(
+    bot: Bot,
+    telegram_id: int,
+    db: UserDB,
+    now: datetime,
+    settings: NotifySettings,
+) -> None:
     today_iso = now.date().isoformat()
 
     if settings.morning_enabled and settings.last_morning_sent != today_iso:
@@ -123,7 +134,7 @@ async def _check_plan_reminders(bot: Bot, telegram_id: int, db: UserDB, now: dat
 
         if target_dt <= now <= target_dt + GRACE_WINDOW:
             label = format_minutes_label(_remaining_minutes(now, start_dt))
-            text = f'⏰ Через {label} у тебя задача "{row["title"]}"!'
+            text = f'⏰ Через {label} у тебя задача «<b>{html.escape(row["title"])}</b>»!'
             try:
                 await bot.send_message(telegram_id, text)
             except (TelegramForbiddenError, TelegramNotFound):
@@ -159,7 +170,7 @@ async def _check_rule_reminders(bot: Bot, telegram_id: int, db: UserDB, now: dat
 
             if target_dt <= now <= target_dt + GRACE_WINDOW:
                 label = format_minutes_label(_remaining_minutes(now, start_dt))
-                text = f'⏰ Через {label} у тебя задача "{row["title"]}"!'
+                text = f'⏰ Через {label} у тебя задача «<b>{html.escape(row["title"])}</b>»!'
                 try:
                     await bot.send_message(telegram_id, text)
                 except (TelegramForbiddenError, TelegramNotFound):
@@ -177,14 +188,22 @@ def _remaining_minutes(now: datetime, start_dt: datetime) -> int:
     return max(minutes, 0)
 
 
-async def _process_user(bot: Bot, telegram_id: int, now: datetime) -> None:
+async def _process_user(bot: Bot, telegram_id: int) -> None:
     db = open_user_db_by_id(telegram_id)
     if db is None:
         return
     try:
-        await _check_daily_digests(bot, telegram_id, db, now)
-        await _check_plan_reminders(bot, telegram_id, db, now)
-        await _check_rule_reminders(bot, telegram_id, db, now)
+        # Настройки читаем один раз за тик, а не отдельным запросом
+        # в каждой из проверок (раньше было 2 запроса только за время).
+        settings = get_settings(db)
+        if settings.timezone_configured and settings.utc_offset is not None:
+            user_now = now_for_offset(int(settings.utc_offset))
+        else:
+            user_now = now_for_offset(None)
+
+        await _check_daily_digests(bot, telegram_id, db, user_now, settings)
+        await _check_plan_reminders(bot, telegram_id, db, user_now)
+        await _check_rule_reminders(bot, telegram_id, db, user_now)
     except Exception:  # noqa: BLE001 - один сбой не должен останавливать весь цикл
         logger.exception("Ошибка при обработке уведомлений для пользователя %s", telegram_id)
     finally:
@@ -194,10 +213,15 @@ async def _process_user(bot: Bot, telegram_id: int, now: datetime) -> None:
 async def run_notifier(bot: Bot) -> None:
     logger.info("Планировщик уведомлений запущен (интервал %s сек.)", NOTIFIER_POLL_INTERVAL)
     while True:
+        started = time.monotonic()
         try:
-            now = now_local()
             for telegram_id in list(iter_all_user_ids()):
-                await _process_user(bot, telegram_id, now)
+                await _process_user(bot, telegram_id)
+                # Даём event loop обработать входящие сообщения, чтобы при
+                # большом числе пользователей бот не «замирал» на этом цикле.
+                await asyncio.sleep(0)
         except Exception:  # noqa: BLE001
             logger.exception("Ошибка в цикле планировщика уведомлений")
-        await asyncio.sleep(NOTIFIER_POLL_INTERVAL)
+
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(max(1.0, NOTIFIER_POLL_INTERVAL - elapsed))
