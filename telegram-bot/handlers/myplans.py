@@ -37,13 +37,15 @@ from database.plans_repo import (
     get_rule_row,
     get_scheduled_days,
     get_plan_counts_for_dates,
+    add_reminder,
+    delete_reminder,
+    get_reminders,
+    set_reminders,
     toggle_plan_done,
     toggle_rule_active,
     toggle_rule_done,
     update_plan,
-    update_plan_reminder,
     update_rule,
-    update_rule_reminder,
 )
 from keyboards.inline import (
     all_days_keyboard,
@@ -58,6 +60,7 @@ from keyboards.inline import (
     item_detail_keyboard,
     recur_delete_confirm_keyboard,
     reminder_choice_keyboard,
+    reminders_menu_keyboard,
     rules_delete_keyboard,
     stats_keyboard,
     week_days_keyboard,
@@ -77,7 +80,7 @@ from utils.date_utils import (
     parse_time,
     weekday_name,
 )
-from utils.reminder_utils import describe_reminder, parse_reminder_offset
+from utils.reminder_utils import describe_reminders, parse_reminder_offset
 from utils.repeat_parser import describe_rule
 from utils.text import (
     MAX_DESCRIPTION,
@@ -628,7 +631,7 @@ async def on_toggle_done(callback: CallbackQuery, db: UserDB) -> None:
 
     await _safe_edit(
         callback.message,
-        _item_detail_text(target, describe_reminder(target.reminder_minutes)),
+        _item_detail_text(target, describe_reminders(target.reminders)),
         item_detail_keyboard(d, target),
     )
 
@@ -656,7 +659,7 @@ async def on_view_item(callback: CallbackQuery, db: UserDB) -> None:
 
     text = (
         f"{reminder_note}"
-        f"{_item_detail_text(target, describe_reminder(target.reminder_minutes))}"
+        f"{_item_detail_text(target, describe_reminders(target.reminders))}"
     )
 
     await callback.answer()
@@ -786,7 +789,7 @@ async def process_edit_value(
         return
 
     await message.answer(
-        _item_detail_text(target, describe_reminder(target.reminder_minutes)),
+        _item_detail_text(target, describe_reminders(target.reminders)),
         reply_markup=item_detail_keyboard(show_date, target),
     )
 
@@ -997,6 +1000,84 @@ async def on_add_to_day(callback: CallbackQuery, state: FSMContext) -> None:
         await start_new_plan_with_date(callback.message, state, d)
 
 
+def _reminder_title(db: UserDB, kind: str, source_id: int) -> str:
+    row = get_plan_row(db, source_id) if kind == "plan" else get_rule_row(db, source_id)
+    return row["title"] if row is not None else "задача"
+
+
+async def _show_reminders_menu(
+    message: Message | None, db: UserDB, kind: str, source_id: int, iso_date: str
+) -> None:
+    reminders = get_reminders(db, kind, source_id)
+    text = (
+        "🔔 <b>Напоминания</b>\n"
+        f"Задача: <b>{esc(_reminder_title(db, kind, source_id), MAX_TITLE)}</b>\n\n"
+        f"{describe_reminders(reminders)}\n\n"
+        "Нажми на пресет, чтобы добавить или убрать напоминание. "
+        "«Своё значение» — для любого интервала."
+    )
+    await _safe_edit(
+        message,
+        text,
+        reminders_menu_keyboard(kind, source_id, iso_date, reminders),
+    )
+
+
+@router.callback_query(F.data.startswith("rem_menu:"))
+async def cb_rem_menu(callback: CallbackQuery, db: UserDB) -> None:
+    _, kind, source_id_str, iso_date = (callback.data or "").split(":", 3)
+    await callback.answer()
+    await _show_reminders_menu(
+        callback.message, db, kind, int(source_id_str), iso_date
+    )
+
+
+@router.callback_query(F.data.startswith("rem_toggle:"))
+async def cb_rem_toggle(callback: CallbackQuery, db: UserDB) -> None:
+    _, kind, source_id_str, iso_date, minutes_str = (callback.data or "").split(
+        ":", 4
+    )
+    source_id = int(source_id_str)
+    minutes = int(minutes_str)
+    if minutes in get_reminders(db, kind, source_id):
+        delete_reminder(db, kind, source_id, minutes)
+        await callback.answer("Убрано")
+    else:
+        add_reminder(db, kind, source_id, minutes)
+        await callback.answer("Добавлено")
+    await _show_reminders_menu(callback.message, db, kind, source_id, iso_date)
+
+
+@router.callback_query(F.data.startswith("rem_del:"))
+async def cb_rem_del(callback: CallbackQuery, db: UserDB) -> None:
+    _, kind, source_id_str, iso_date, minutes_str = (callback.data or "").split(
+        ":", 4
+    )
+    source_id = int(source_id_str)
+    minutes = int(minutes_str)
+    delete_reminder(db, kind, source_id, minutes)
+    await callback.answer("Убрано")
+    await _show_reminders_menu(callback.message, db, kind, source_id, iso_date)
+
+
+@router.callback_query(F.data.startswith("rem_custom:"))
+async def cb_rem_custom(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    _, kind, source_id_str, iso_date = (callback.data or "").split(":", 3)
+    await callback.answer()
+    await state.set_state(ReminderEditStates.waiting_value)
+    await state.update_data(
+        kind=kind, source_id=int(source_id_str), iso_date=iso_date
+    )
+    if callback.message:
+        await callback.message.answer(
+            "За сколько времени напомнить? Напиши, например «за 45 минут», "
+            "или выбери вариант:",
+            reply_markup=reminder_choice_keyboard("redit_rem"),
+        )
+
+
 @router.callback_query(F.data.startswith("remind_edit:"))
 async def on_remind_edit(
     callback: CallbackQuery, state: FSMContext, db: UserDB
@@ -1038,10 +1119,10 @@ async def _apply_reminder_change(
     iso_date = data["iso_date"]
     d = datetime.strptime(iso_date, "%Y-%m-%d").date()
 
-    if kind == "plan":
-        update_plan_reminder(db, source_id, minutes)
+    if minutes > 0:
+        add_reminder(db, kind, source_id, minutes)
     else:
-        update_rule_reminder(db, source_id, minutes)
+        set_reminders(db, kind, source_id, [])
 
     await state.clear()
 
@@ -1052,8 +1133,8 @@ async def _apply_reminder_change(
         return
 
     await message.answer(
-        f"Готово ✅ {describe_reminder(minutes)}.\n\n"
-        f"{_item_detail_text(target, describe_reminder(target.reminder_minutes))}",
+        f"Готово ✅ {describe_reminders(get_reminders(db, kind, source_id))}.\n\n"
+        f"{_item_detail_text(target, describe_reminders(target.reminders))}",
         reply_markup=item_detail_keyboard(d, target),
     )
 

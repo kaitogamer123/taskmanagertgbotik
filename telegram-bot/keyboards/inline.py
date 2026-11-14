@@ -16,6 +16,7 @@ from database.plans_repo import (
 from database.settings_repo import NotifySettings
 from utils.clock import format_zone_offset
 from utils.date_utils import format_date_ru, get_week_window, weekday_name
+from utils.reminder_utils import format_minutes_label
 from utils.text import clip, clip_button
 from utils.timezones import COMMON_ZONES, zone_button_label
 
@@ -92,6 +93,7 @@ def week_days_keyboard(
     )
     builder.row(
         InlineKeyboardButton(text="🗑 Удалить задачу", callback_data="del_menu"),
+        InlineKeyboardButton(text="📋 Шаблоны", callback_data="tpl_menu"),
     )
     return builder.as_markup()
 
@@ -187,8 +189,15 @@ def item_detail_keyboard(d: date, item: PlanItem) -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
-            text="⏰ Изменить время оповещения",
-            callback_data=f"remind_edit:{item.kind}:{item.source_id}:{d.isoformat()}",
+            text="🔔 Напоминания"
+            + (f" ({len(item.reminders)})" if item.reminders else ""),
+            callback_data=f"rem_menu:{item.kind}:{item.source_id}:{d.isoformat()}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="💾 Сохранить как шаблон",
+            callback_data=f"tpl_save:{item.kind}:{item.source_id}:{d.isoformat()}",
         )
     )
     builder.row(
@@ -494,6 +503,42 @@ def reminder_choice_keyboard(prefix: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def reminders_menu_keyboard(
+    kind: str, source_id: int, iso_date: str, reminders: list[int]
+) -> InlineKeyboardMarkup:
+    """Меню нескольких напоминаний: пресеты-переключатели + свои значения."""
+    preset_values = {minutes for _, minutes in REMINDER_PRESETS}
+    builder = InlineKeyboardBuilder()
+    for label, minutes in REMINDER_PRESETS:
+        mark = "✅" if minutes in reminders else "➕"
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(f"{mark} за {label}"),
+                callback_data=f"rem_toggle:{kind}:{source_id}:{iso_date}:{minutes}",
+            )
+        )
+    for minutes in sorted(set(reminders) - preset_values, reverse=True):
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(f"❌ за {format_minutes_label(minutes)}"),
+                callback_data=f"rem_del:{kind}:{source_id}:{iso_date}:{minutes}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="⏰ Своё значение",
+            callback_data=f"rem_custom:{kind}:{source_id}:{iso_date}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=f"view:{kind}:{source_id}:{iso_date}",
+        )
+    )
+    return builder.as_markup()
+
+
 def settings_keyboard(
     settings: NotifySettings, current_time_str: str
 ) -> InlineKeyboardMarkup:
@@ -749,6 +794,85 @@ def snooze_keyboard(
             callback_data=f"snz:{kind}:{source_id}:{date_part}:{minutes}",
         )
     builder.adjust(3)
+    return builder.as_markup()
+
+
+def templates_menu_keyboard(
+    templates: list, page: int = 0, page_size: int = 10
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    start = page * page_size
+    for template in templates[start : start + page_size]:
+        label = f"📋 {template['title']}"
+        if template["time_start"]:
+            label += f" {template['time_start']}"
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(label),
+                callback_data=f"tpl:{template['id']}",
+            )
+        )
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text="⬅️", callback_data=f"tpl_page:{page - 1}"
+            )
+        )
+    if start + page_size < len(templates):
+        nav.append(
+            InlineKeyboardButton(
+                text="➡️", callback_data=f"tpl_page:{page + 1}"
+            )
+        )
+    if nav:
+        builder.row(*nav)
+    builder.row(
+        InlineKeyboardButton(text="➕ Новый шаблон", callback_data="tpl_new"),
+        InlineKeyboardButton(text="⬅️ В меню", callback_data="week_menu"),
+    )
+    return builder.as_markup()
+
+
+def template_card_keyboard(template_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="📅 Сегодня", callback_data=f"tpl_use:{template_id}:today"
+        ),
+        InlineKeyboardButton(
+            text="📅 Завтра", callback_data=f"tpl_use:{template_id}:tomorrow"
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📅 Другая дата", callback_data=f"tpl_use_date:{template_id}"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🗑 Удалить шаблон", callback_data=f"tpl_delete:{template_id}"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ К шаблонам", callback_data="tpl_menu")
+    )
+    return builder.as_markup()
+
+
+def template_delete_confirm_keyboard(template_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🗑 Да, удалить",
+            callback_data=f"tpl_delete_yes:{template_id}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ Отмена", callback_data=f"tpl:{template_id}"
+        )
+    )
     return builder.as_markup()
 
 

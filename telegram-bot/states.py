@@ -64,3 +64,8 @@ class BroadcastStates(StatesGroup):
 
 class FeedbackStates(StatesGroup):
     waiting_text = State()
+
+
+class TemplateStates(StatesGroup):
+    waiting_line = State()
+    waiting_date = State()

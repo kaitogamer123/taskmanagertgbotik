@@ -38,6 +38,7 @@ from handlers import (
     snooze,
     start,
     system_cmd,
+    templates,
     timezone_cmd,
 )
 from middlewares.antispam import AntispamMiddleware
@@ -127,6 +128,7 @@ async def set_bot_commands(bot: Bot) -> None:
                 BotCommand(command="add", description="Быстро добавить задачу строкой"),
                 BotCommand(command="everyn", description="Добавить повторяющуюся задачу"),
                 BotCommand(command="notes", description="Заметки и папки"),
+                BotCommand(command="templates", description="Шаблоны задач"),
                 BotCommand(command="find", description="Поиск по задачам и заметкам"),
                 BotCommand(command="stats", description="Статистика выполнения"),
                 BotCommand(command="feedback", description="Написать владельцу бота"),
@@ -210,6 +212,7 @@ async def main() -> None:
     dp.include_router(everyn.router)
     dp.include_router(notes.router)
     dp.include_router(snooze.router)
+    dp.include_router(templates.router)
     dp.include_router(myplans.router)
 
     await set_bot_commands(bot)

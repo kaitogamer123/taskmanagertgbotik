@@ -213,6 +213,34 @@ def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> 
             remind_at TEXT NOT NULL,
             created_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS task_reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,           -- plan | recur
+            source_id INTEGER NOT NULL,
+            minutes INTEGER NOT NULL,
+            created_at TEXT,
+            UNIQUE(kind, source_id, minutes)
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_reminders_source
+            ON task_reminders(kind, source_id);
+
+        CREATE TABLE IF NOT EXISTS reminder_sent (
+            reminder_id INTEGER NOT NULL,
+            occurrence_date TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY(reminder_id, occurrence_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS task_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            time_start TEXT,
+            time_end TEXT,
+            reminder_minutes INTEGER,
+            created_at TEXT
+        );
         """
     )
     conn.commit()
@@ -292,6 +320,26 @@ def _migrate_schema(
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_plans_reminder "
         "ON plans(reminder_sent, reminder_minutes)"
+    )
+
+    # Переносим старые одиночные напоминания в task_reminders (идемпотентно).
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO task_reminders
+            (kind, source_id, minutes, created_at)
+        SELECT 'plan', id, reminder_minutes, datetime('now','localtime')
+        FROM plans
+        WHERE reminder_minutes IS NOT NULL AND reminder_minutes > 0
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO task_reminders
+            (kind, source_id, minutes, created_at)
+        SELECT 'recur', id, reminder_minutes, datetime('now','localtime')
+        FROM recurring_rules
+        WHERE reminder_minutes IS NOT NULL AND reminder_minutes > 0
+        """
     )
 
     conn.execute(

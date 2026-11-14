@@ -121,3 +121,12 @@ def describe_reminder(minutes: Optional[int]) -> str:
     if not minutes:
         return "🔕 Напоминание выключено"
     return f"⏰ Напомню за {format_minutes_label(minutes)} до начала"
+
+
+def describe_reminders(minutes: list[int]) -> str:
+    values = sorted({int(m) for m in minutes if int(m) > 0}, reverse=True)
+    if not values:
+        return "🔕 Напоминания выключены"
+    return "⏰ Напоминания: " + ", ".join(
+        f"за {format_minutes_label(m)}" for m in values
+    )

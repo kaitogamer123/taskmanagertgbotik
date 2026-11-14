@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import calendar
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -26,6 +26,7 @@ class PlanItem:
     rule_type: Optional[str] = None
     rule_value: Optional[str] = None
     done_at: Optional[str] = None
+    reminders: list[int] = field(default_factory=list)
 
     def sort_key(self):
         return (0 if self.time_start else 1, self.time_start or "99:99")
@@ -62,6 +63,8 @@ def add_plan(
         ),
     )
     db.conn.commit()
+    if reminder_minutes and reminder_minutes > 0:
+        add_reminder(db, "plan", int(cur.lastrowid), int(reminder_minutes))
     return cur.lastrowid
 
 
@@ -94,12 +97,140 @@ def add_recurring_rule(
         ),
     )
     db.conn.commit()
+    if reminder_minutes and reminder_minutes > 0:
+        add_reminder(db, "recur", int(cur.lastrowid), int(reminder_minutes))
     return cur.lastrowid
+
+
+def _insert_reminder_row(
+    db: UserDB, kind: str, source_id: int, minutes: int
+) -> None:
+    if minutes <= 0:
+        return
+    db.conn.execute(
+        """
+        INSERT OR IGNORE INTO task_reminders
+            (kind, source_id, minutes, created_at)
+        VALUES (?, ?, ?, datetime('now','localtime'))
+        """,
+        (kind, source_id, int(minutes)),
+    )
+
+
+def get_reminders(db: UserDB, kind: str, source_id: int) -> list[int]:
+    rows = db.conn.execute(
+        "SELECT minutes FROM task_reminders "
+        "WHERE kind = ? AND source_id = ? ORDER BY minutes DESC",
+        (kind, source_id),
+    ).fetchall()
+    return [int(row["minutes"]) for row in rows]
+
+
+def _sync_legacy_reminder(db: UserDB, kind: str, source_id: int) -> None:
+    values = get_reminders(db, kind, source_id)
+    legacy = max(values) if values else None
+    table = "plans" if kind == "plan" else "recurring_rules"
+    db.conn.execute(
+        f"UPDATE {table} SET reminder_minutes = ? WHERE id = ?",
+        (legacy, source_id),
+    )
+
+
+def add_reminder(db: UserDB, kind: str, source_id: int, minutes: int) -> None:
+    _insert_reminder_row(db, kind, source_id, int(minutes))
+    _sync_legacy_reminder(db, kind, source_id)
+    db.conn.commit()
+
+
+def _clear_reminders(db: UserDB, kind: str, source_id: int) -> None:
+    db.conn.execute(
+        "DELETE FROM reminder_sent WHERE reminder_id IN "
+        "(SELECT id FROM task_reminders WHERE kind = ? AND source_id = ?)",
+        (kind, source_id),
+    )
+    db.conn.execute(
+        "DELETE FROM task_reminders WHERE kind = ? AND source_id = ?",
+        (kind, source_id),
+    )
+
+
+def set_reminders(
+    db: UserDB, kind: str, source_id: int, minutes_list: list[int]
+) -> None:
+    _clear_reminders(db, kind, source_id)
+    for minutes in sorted({int(m) for m in minutes_list if int(m) > 0}):
+        _insert_reminder_row(db, kind, source_id, minutes)
+    _sync_legacy_reminder(db, kind, source_id)
+    db.conn.commit()
+
+
+def delete_reminder(
+    db: UserDB, kind: str, source_id: int, minutes: int
+) -> None:
+    row = db.conn.execute(
+        "SELECT id FROM task_reminders "
+        "WHERE kind = ? AND source_id = ? AND minutes = ?",
+        (kind, source_id, int(minutes)),
+    ).fetchone()
+    if row is None:
+        return
+    db.conn.execute(
+        "DELETE FROM reminder_sent WHERE reminder_id = ?", (row["id"],)
+    )
+    db.conn.execute("DELETE FROM task_reminders WHERE id = ?", (row["id"],))
+    _sync_legacy_reminder(db, kind, source_id)
+    db.conn.commit()
+
+
+def mark_reminder_sent(
+    db: UserDB, reminder_id: int, occurrence_date: str
+) -> None:
+    db.conn.execute(
+        """
+        INSERT OR REPLACE INTO reminder_sent
+            (reminder_id, occurrence_date, sent_at)
+        VALUES (?, ?, datetime('now','localtime'))
+        """,
+        (reminder_id, occurrence_date),
+    )
+    db.conn.commit()
+
+
+def is_reminder_sent(
+    db: UserDB, reminder_id: int, occurrence_date: str
+) -> bool:
+    row = db.conn.execute(
+        "SELECT 1 FROM reminder_sent "
+        "WHERE reminder_id = ? AND occurrence_date = ?",
+        (reminder_id, occurrence_date),
+    ).fetchone()
+    return row is not None
+
+
+def clear_reminder_marks(
+    db: UserDB, kind: str, source_id: int, occurrence_date: Optional[str] = None
+) -> None:
+    if occurrence_date is None:
+        db.conn.execute(
+            "DELETE FROM reminder_sent WHERE reminder_id IN "
+            "(SELECT id FROM task_reminders WHERE kind = ? AND source_id = ?)",
+            (kind, source_id),
+        )
+    else:
+        db.conn.execute(
+            "DELETE FROM reminder_sent WHERE occurrence_date = ? AND reminder_id IN "
+            "(SELECT id FROM task_reminders WHERE kind = ? AND source_id = ?)",
+            (occurrence_date, kind, source_id),
+        )
+    db.conn.commit()
 
 
 def update_plan_reminder(
     db: UserDB, plan_id: int, reminder_minutes: Optional[int]
 ) -> None:
+    set_reminders(
+        db, "plan", plan_id, [int(reminder_minutes)] if reminder_minutes and reminder_minutes > 0 else []
+    )
     db.conn.execute(
         "UPDATE plans SET reminder_minutes = ?, reminder_sent = 0 WHERE id = ?",
         (reminder_minutes or None, plan_id),
@@ -110,8 +241,12 @@ def update_plan_reminder(
 def update_rule_reminder(
     db: UserDB, rule_id: int, reminder_minutes: Optional[int]
 ) -> None:
+    set_reminders(
+        db, "recur", rule_id, [int(reminder_minutes)] if reminder_minutes and reminder_minutes > 0 else []
+    )
     db.conn.execute(
-        "UPDATE recurring_rules SET reminder_minutes = ?, last_reminder_date = NULL WHERE id = ?",
+        "UPDATE recurring_rules SET reminder_minutes = ?, last_reminder_date = NULL "
+        "WHERE id = ?",
         (reminder_minutes or None, rule_id),
     )
     db.conn.commit()
@@ -168,6 +303,15 @@ def get_plans_for_date(
 ) -> list[PlanItem]:
     items: list[PlanItem] = []
 
+    reminders_map: dict[tuple[str, int], list[int]] = {}
+    for reminder in db.conn.execute(
+        "SELECT kind, source_id, minutes FROM task_reminders "
+        "ORDER BY minutes DESC"
+    ):
+        reminders_map.setdefault(
+            (reminder["kind"], int(reminder["source_id"])), []
+        ).append(int(reminder["minutes"]))
+
     plan_rows = db.conn.execute(
         "SELECT * FROM plans WHERE plan_date = ? ORDER BY id", (d.isoformat(),)
     ).fetchall()
@@ -182,6 +326,7 @@ def get_plans_for_date(
                 description=row["description"],
                 reminder_minutes=row["reminder_minutes"],
                 done_at=row["done_at"],
+                reminders=reminders_map.get(("plan", int(row["id"])), []),
             )
         )
 
@@ -208,6 +353,7 @@ def get_plans_for_date(
                     rule_type=rule["rule_type"],
                     rule_value=rule["rule_value"],
                     done_at=done_rules.get(int(rule["id"])),
+                    reminders=reminders_map.get(("recur", int(rule["id"])), []),
                 )
             )
 
@@ -230,11 +376,13 @@ def get_all_recurring_rules(db: UserDB) -> list[sqlite3.Row]:
 
 
 def delete_plan(db: UserDB, plan_id: int) -> None:
+    _clear_reminders(db, "plan", plan_id)
     db.conn.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
     db.conn.commit()
 
 
 def delete_rule(db: UserDB, rule_id: int) -> None:
+    _clear_reminders(db, "recur", rule_id)
     db.conn.execute("DELETE FROM rule_completions WHERE rule_id = ?", (rule_id,))
     db.conn.execute("DELETE FROM recurring_rules WHERE id = ?", (rule_id,))
     db.conn.commit()
@@ -251,6 +399,11 @@ def exclude_rule_date(db: UserDB, rule_id: int, d: date) -> None:
         "UPDATE recurring_rules SET excluded_dates = ? WHERE id = ?",
         (",".join(sorted(excluded)), rule_id),
     )
+    db.conn.execute(
+        "DELETE FROM reminder_sent WHERE occurrence_date = ? AND reminder_id IN "
+        "(SELECT id FROM task_reminders WHERE kind = 'recur' AND source_id = ?)",
+        (d.isoformat(), rule_id),
+    )
     db.conn.commit()
 
 
@@ -263,6 +416,17 @@ def delete_all_for_date(db: UserDB, d: date) -> int:
     items = get_plans_for_date(db, d)
     if not items:
         return 0
+    plan_ids = [
+        int(row["id"])
+        for row in db.conn.execute(
+            "SELECT id FROM plans WHERE plan_date = ?", (d.isoformat(),)
+        ).fetchall()
+    ]
+    for plan_id in plan_ids:
+        _clear_reminders(db, "plan", plan_id)
+    db.conn.execute(
+        "DELETE FROM reminder_sent WHERE occurrence_date = ?", (d.isoformat(),)
+    )
     db.conn.execute("DELETE FROM plans WHERE plan_date = ?", (d.isoformat(),))
     db.conn.execute(
         "DELETE FROM rule_completions WHERE occurrence_date = ?", (d.isoformat(),)
@@ -536,6 +700,12 @@ def update_plan(
     params.append(plan_id)
     if sets:
         db.conn.execute(f"UPDATE plans SET {', '.join(sets)} WHERE id = ?", params)
+        if reset_reminder:
+            db.conn.execute(
+                "DELETE FROM reminder_sent WHERE reminder_id IN "
+                "(SELECT id FROM task_reminders WHERE kind = 'plan' AND source_id = ?)",
+                (plan_id,),
+            )
         db.conn.commit()
 
 
@@ -550,6 +720,7 @@ def update_rule(
 ) -> None:
     sets: list[str] = []
     params: list[object] = []
+    reset_reminder = False
     if title is not _UNSET:
         sets.append("title = ?")
         params.append(title)
@@ -565,6 +736,7 @@ def update_rule(
         sets.append("time_start = ?")
         params.append(time_start)
         sets.append("last_reminder_date = NULL")
+        reset_reminder = True
     if time_end is not _UNSET:
         sets.append("time_end = ?")
         params.append(time_end)
@@ -573,4 +745,10 @@ def update_rule(
         db.conn.execute(
             f"UPDATE recurring_rules SET {', '.join(sets)} WHERE id = ?", params
         )
+        if reset_reminder:
+            db.conn.execute(
+                "DELETE FROM reminder_sent WHERE reminder_id IN "
+                "(SELECT id FROM task_reminders WHERE kind = 'recur' AND source_id = ?)",
+                (rule_id,),
+            )
         db.conn.commit()

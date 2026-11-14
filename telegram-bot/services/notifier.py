@@ -38,7 +38,9 @@ from database.plans_repo import (
     delete_snooze,
     due_snoozes,
     get_plans_for_date,
+    is_reminder_sent,
     is_rule_done,
+    mark_reminder_sent,
 )
 from database.settings_repo import (
     NotifySettings,
@@ -229,16 +231,18 @@ async def _check_plan_reminders(
 ) -> None:
     rows = db.conn.execute(
         """
-        SELECT id, plan_date, time_start, title, reminder_minutes FROM plans
-        WHERE reminder_sent = 0
-          AND reminder_minutes IS NOT NULL
-          AND reminder_minutes > 0
-          AND time_start IS NOT NULL
-          AND done_at IS NULL
+        SELECT p.id AS plan_id, p.plan_date, p.time_start, p.title,
+               r.id AS reminder_id, r.minutes AS minutes
+        FROM plans p
+        JOIN task_reminders r ON r.kind = 'plan' AND r.source_id = p.id
+        LEFT JOIN reminder_sent s
+          ON s.reminder_id = r.id AND s.occurrence_date = p.plan_date
+        WHERE p.time_start IS NOT NULL
+          AND p.done_at IS NULL
+          AND s.reminder_id IS NULL
         """
     ).fetchall()
 
-    changed = False
     for row in rows:
         try:
             plan_date = date.fromisoformat(row["plan_date"])
@@ -249,15 +253,11 @@ async def _check_plan_reminders(
         start_dt = datetime.combine(plan_date, datetime.min.time()).replace(
             hour=hh, minute=mm
         )
-        target_dt = start_dt - timedelta(minutes=row["reminder_minutes"] or 0)
+        target_dt = start_dt - timedelta(minutes=int(row["minutes"]))
         target_dt = _adjust_for_quiet(target_dt, settings)
 
-        # Просроченное напоминание больше не сканируем каждый тик
         if now > target_dt + GRACE_WINDOW:
-            db.conn.execute(
-                "UPDATE plans SET reminder_sent = 1 WHERE id = ?", (row["id"],)
-            )
-            changed = True
+            mark_reminder_sent(db, int(row["reminder_id"]), row["plan_date"])
             continue
 
         if target_dt <= now <= target_dt + GRACE_WINDOW:
@@ -267,18 +267,12 @@ async def _check_plan_reminders(
                     bot,
                     telegram_id,
                     text,
-                    reply_markup=snooze_keyboard("plan", int(row["id"])),
+                    reply_markup=snooze_keyboard("plan", int(row["plan_id"])),
                 )
             except (TelegramForbiddenError, TelegramNotFound):
                 mark_user_blocked(db.conn)
                 raise UserBlocked
-            db.conn.execute(
-                "UPDATE plans SET reminder_sent = 1 WHERE id = ?", (row["id"],)
-            )
-            changed = True
-
-    if changed:
-        db.conn.commit()
+            mark_reminder_sent(db, int(row["reminder_id"]), row["plan_date"])
 
 
 async def _check_rule_reminders(
@@ -290,35 +284,42 @@ async def _check_rule_reminders(
 ) -> None:
     rows = db.conn.execute(
         """
-        SELECT * FROM recurring_rules
-        WHERE reminder_minutes IS NOT NULL
-          AND reminder_minutes > 0
-          AND time_start IS NOT NULL
+        SELECT rr.*, r.id AS reminder_id, r.minutes AS minutes
+        FROM recurring_rules rr
+        JOIN task_reminders r ON r.kind = 'recur' AND r.source_id = rr.id
+        WHERE rr.time_start IS NOT NULL
         """
     ).fetchall()
 
-    changed = False
     for row in rows:
         try:
             hh, mm = (int(x) for x in row["time_start"].split(":"))
         except (ValueError, AttributeError):
             continue
 
-        horizon = _reminder_horizon_days(int(row["reminder_minutes"] or 0))
+        horizon = _reminder_horizon_days(int(row["minutes"]))
         for offset_days in range(horizon):
             candidate_date = now.date() + timedelta(days=offset_days)
-            if row["last_reminder_date"] == candidate_date.isoformat():
+            if is_rule_done(db, int(row["id"]), candidate_date):
+                continue
+            if is_reminder_sent(
+                db, int(row["reminder_id"]), candidate_date.isoformat()
+            ):
                 continue
             if not _rule_occurs_on(row, candidate_date):
-                continue
-            if is_rule_done(db, int(row["id"]), candidate_date):
                 continue
 
             start_dt = datetime.combine(
                 candidate_date, datetime.min.time()
             ).replace(hour=hh, minute=mm)
-            target_dt = start_dt - timedelta(minutes=row["reminder_minutes"] or 0)
+            target_dt = start_dt - timedelta(minutes=int(row["minutes"]))
             target_dt = _adjust_for_quiet(target_dt, settings)
+
+            if now > target_dt + GRACE_WINDOW:
+                mark_reminder_sent(
+                    db, int(row["reminder_id"]), candidate_date.isoformat()
+                )
+                continue
 
             if target_dt <= now <= target_dt + GRACE_WINDOW:
                 text = _reminder_text(row["title"], now, start_dt)
@@ -334,15 +335,10 @@ async def _check_rule_reminders(
                 except (TelegramForbiddenError, TelegramNotFound):
                     mark_user_blocked(db.conn)
                     raise UserBlocked
-                db.conn.execute(
-                    "UPDATE recurring_rules SET last_reminder_date = ? WHERE id = ?",
-                    (candidate_date.isoformat(), row["id"]),
+                mark_reminder_sent(
+                    db, int(row["reminder_id"]), candidate_date.isoformat()
                 )
-                changed = True
                 break
-
-    if changed:
-        db.conn.commit()
 
 
 async def _check_snoozes(
