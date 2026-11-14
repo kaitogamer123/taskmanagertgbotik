@@ -26,6 +26,12 @@ from utils.date_utils import (
     weekday_name,
 )
 from utils.reminder_utils import describe_reminder, parse_reminder_offset
+from utils.text import (
+    MAX_DESCRIPTION,
+    MAX_TITLE,
+    esc,
+    unquote_menu_literal,
+)
 
 router = Router(name="newplan")
 
@@ -155,7 +161,9 @@ async def skip_time_end(callback: CallbackQuery, state: FSMContext) -> None:
 async def _ask_title(message: Message, state: FSMContext) -> None:
     await state.set_state(NewPlanStates.waiting_title)
     await message.answer(
-        "Как назвать задачу? Напиши короткое название.",
+        "Как назвать задачу? Напиши короткое название.\n"
+        "<i>(до 100 символов; если название совпадает с кнопкой меню — "
+        "оберни его в «кавычки»)</i>",
         reply_markup=cancel_inline_keyboard(),
     )
 
@@ -166,14 +174,20 @@ async def _ask_title(message: Message, state: FSMContext) -> None:
     ~F.text.in_(MAIN_MENU_BUTTONS),
 )
 async def process_title(message: Message, state: FSMContext) -> None:
-    title = (message.text or "").strip()
+    title = unquote_menu_literal((message.text or "").strip(), MAIN_MENU_BUTTONS)
     if not title:
         await message.answer("Название не может быть пустым, напиши ещё раз.")
+        return
+    if len(title) > MAX_TITLE:
+        await message.answer(
+            f"Слишком длинное название 🙈 Максимум {MAX_TITLE} символов. Сократи."
+        )
         return
     await state.update_data(title=title)
     await state.set_state(NewPlanStates.waiting_description)
     await message.answer(
-        "Хочешь добавить описание задачи? Напиши его или нажми «Без описания».",
+        "Хочешь добавить описание задачи? Напиши его или нажми «Без описания».\n"
+        f"<i>(до {MAX_DESCRIPTION} символов)</i>",
         reply_markup=skip_keyboard("np_skip_desc", "Без описания"),
     )
 
@@ -196,7 +210,12 @@ _NO_DESCRIPTION_WORDS = {
 async def process_description(
     message: Message, state: FSMContext, db: UserDB
 ) -> None:
-    raw = (message.text or "").strip()
+    raw = unquote_menu_literal((message.text or "").strip(), MAIN_MENU_BUTTONS)
+    if len(raw) > MAX_DESCRIPTION:
+        await message.answer(
+            f"Слишком длинное описание 🙈 Максимум {MAX_DESCRIPTION} символов. Сократи."
+        )
+        return
     description = None if raw.lower() in _NO_DESCRIPTION_WORDS or not raw else raw
     await state.update_data(description=description)
     await _ask_reminder_or_save(message, state, db)
@@ -284,8 +303,8 @@ async def _save_plan(
         "Готово! ✅ Задача добавлена:\n\n"
         f"📅 {format_date_full_ru(plan_date)} ({weekday_name(plan_date)})\n"
         f"🕐 {html.escape(time_label)}\n"
-        f"📝 <b>{html.escape(title)}</b>\n"
-        f"💬 {html.escape(description) if description else 'Описание отсутствует'}\n"
+        f"📝 <b>{esc(title, MAX_TITLE)}</b>\n"
+        f"💬 {esc(description, MAX_DESCRIPTION) if description else 'Описание отсутствует'}\n"
         f"{describe_reminder(reminder_minutes)}\n\n"
         "Посмотреть все планы можно кнопкой «📅 Мои планы» или «📋 Дни с задачами».",
         reply_markup=main_reply_keyboard(),

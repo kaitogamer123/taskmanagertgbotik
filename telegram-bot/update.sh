@@ -1,69 +1,82 @@
 #!/usr/bin/env bash
-set -e
+# Обновление и перезапуск TaskMNGR на сервере.
+#
+# Работает в двух режимах:
+#   * если папка — git-репозиторий: git pull/reset, затем перезапуск;
+#   * если git нет (как на текущем сервере): просто ставит зависимости
+#     и перезапускает бота. Код в этом случае заливается через TaskMNGR.bat.
+set -euo pipefail
 
-# Переходим в папку, где лежит сам скрипт (telegram-bot/)
 cd "$(dirname "$0")"
 
-SCREEN_NAME="plans_bot"
-
-echo "=============================================="
-echo "🚀 ОБНОВЛЕНИЕ БОТА TASK MANAGER"
-echo "=============================================="
-
-# Игнорируем смену прав (chmod +x), чтобы git pull никогда не конфликтовал
-git config core.fileMode false 2>/dev/null || true
-
-# 1. Скачиваем свежий код с GitHub (БД в PlanesUser/ и .env защищены .gitignore)
-echo "[1/3] Загрузка изменений с Git..."
-git pull --ff-only || {
-    echo "Обнаружены локальные правки в отслеживаемых файлах — синхронизирую с веткой GitHub..."
-    git fetch origin
-    UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || echo "origin/main")
-    git reset --hard "$UPSTREAM"
-}
-
-# Подбираем интерпретатор Python (venv или системный)
+SCREEN_NAME="${SCREEN_NAME:-taskbot}"
 if [ -x "venv/bin/python" ]; then
     PY="venv/bin/python"
-    PIP="venv/bin/pip"
-elif python3 -m venv venv 2>/dev/null; then
-    PY="venv/bin/python"
-    PIP="venv/bin/pip"
 else
-    rm -rf venv
     PY="python3"
-    PIP="pip3"
+fi
+PIP="venv/bin/pip"
+
+echo "=============================================="
+echo "🚀 ОБНОВЛЕНИЕ TASKMNRG"
+echo "=============================================="
+
+# 1. Git — только если это действительно репозиторий
+if [ -d ".git" ]; then
+    echo "[1/3] Загрузка изменений с Git..."
+    git config core.fileMode false 2>/dev/null || true
+    git pull --ff-only || {
+        echo "Локальные правки — синхронизирую с удалённой веткой..."
+        git fetch origin
+        UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo origin/main)"
+        git reset --hard "$UPSTREAM"
+    }
+else
+    echo "[1/3] Git-репозиторий не найден — пропускаю git pull."
+    echo "      Код обновляется через TaskMNGR.bat с ПК."
 fi
 
-# 2. Проверяем и обновляем библиотеки (если добавлял новые)
-if [ -f "requirements.txt" ]; then
-    echo "[2/3] Проверка и установка зависимостей..."
-    $PIP install -q -r requirements.txt 2>/dev/null || $PIP install -q --break-system-packages -r requirements.txt
+# 2. Зависимости
+echo "[2/3] Проверка зависимостей..."
+if [ -x "$PIP" ] && [ -f "requirements.txt" ]; then
+    "$PIP" install -q --disable-pip-version-check -r requirements.txt
+else
+    echo "      venv/pip не найдены — пропускаю установку (использую $PY)."
 fi
 
-mkdir -p PlanesUser
+chmod 600 .env 2>/dev/null || true
 
-# 3. Перезапускаем бота в фоновом режиме (screen)
-echo "[3/3] Перезапуск процесса бота..."
-
+# 3. Перезапуск
+echo "[3/3] Перезапуск бота..."
 if command -v screen >/dev/null 2>&1; then
-    # Завершаем старую сессию бота, если она запущена
     screen -S "$SCREEN_NAME" -X quit 2>/dev/null || true
     sleep 1
 
-    # Запускаем бота в новой изолированной фоновой сессии screen
-    screen -dmS "$SCREEN_NAME" "$PY" bot.py
-
-    echo "=============================================="
-    echo "✅ Бот успешно обновлен и перезапущен!"
-    echo "Текущие фоновые процессы:"
-    screen -ls || true
-    echo "=============================================="
-else
-    pkill -f "bot.py" 2>/dev/null || true
+    # Аккуратно добиваем только ЭТОТ бот (cwd = текущая папка),
+    # не трогая чужие bot.py на сервере.
+    for pid in $(pgrep -f '^\./venv/bin/python bot\.py' 2>/dev/null || true); do
+        if [ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)" = "$(pwd)" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
     sleep 1
+
+    screen -dmS "$SCREEN_NAME" "$PY" bot.py
+    sleep 3
+    if ! screen -list | grep -q "$SCREEN_NAME"; then
+        echo "❌ ОШИБКА: screen-сессия не запустилась."
+        exit 1
+    fi
+    screen -ls || true
+else
+    # Резервный вариант без screen
+    for pid in $(pgrep -f "$(pwd)/bot.py" 2>/dev/null || true); do
+        kill "$pid" 2>/dev/null || true
+    done
     nohup "$PY" bot.py >> bot.log 2>&1 &
-    echo "=============================================="
-    echo "✅ Бот успешно обновлен и запущен в фоне (PID: $!)!"
-    echo "=============================================="
+    echo "✅ Бот запущен в фоне (PID: $!)."
 fi
+
+echo "=============================================="
+echo "✅ Готово."
+echo "=============================================="

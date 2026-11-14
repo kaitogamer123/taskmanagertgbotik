@@ -21,6 +21,17 @@ _DISABLE_WORDS = {
     "-",
 }
 
+# (регулярка, сколько минут в одной единице)
+_REMINDER_PARTS: tuple[tuple[str, int], ...] = (
+    (r"(\d+(?:[.,]\d+)?)\s*(?:день|дня|дней|сутки|суток)", 24 * 60),
+    (r"(\d+(?:[.,]\d+)?)\s*(?:недел\w*)", 7 * 24 * 60),
+    (r"(\d+(?:[.,]\d+)?)\s*(?:месяц\w*)", 30 * 24 * 60),
+    (r"(\d+(?:[.,]\d+)?)\s*(?:ч\b|час\w*)", 60),
+    (r"(\d+(?:[.,]\d+)?)\s*(?:м\b|мин\w*)", 1),
+)
+
+MAX_REMINDER_MINUTES = 366 * 24 * 60
+
 
 def parse_reminder_offset(text: str) -> Optional[int]:
     """
@@ -29,6 +40,9 @@ def parse_reminder_offset(text: str) -> Optional[int]:
         0    — если пользователь явно попросил не напоминать;
         int  — количество минут до задачи;
         None — если не удалось распознать фразу.
+
+    Поддерживает комбинации: "1 час 30 минут", "2 дня", "за неделю",
+    "за 1.5 часа" и т.п.
     """
     raw = text.strip().lower().replace("ё", "е")
     if not raw:
@@ -37,36 +51,35 @@ def parse_reminder_offset(text: str) -> Optional[int]:
     if raw in _DISABLE_WORDS:
         return 0
 
-    # "за X дней/суток"
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(день|дня|дней|сутки|суток)", raw)
-    if m:
-        value = float(m.group(1).replace(",", "."))
-        return int(value * 24 * 60)
+    total = 0.0
+    found = False
+    for pattern, multiplier in _REMINDER_PARTS:
+        for match in re.finditer(pattern, raw):
+            total += float(match.group(1).replace(",", ".")) * multiplier
+            found = True
 
-    # "за X часов/часа/час"
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(ч\b|час\w*)", raw)
-    if m:
-        value = float(m.group(1).replace(",", "."))
-        return int(value * 60)
+    if found:
+        return min(int(total), MAX_REMINDER_MINUTES)
 
-    # "за X минут/мин"
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(м\b|мин\w*)", raw)
-    if m:
-        value = float(m.group(1).replace(",", "."))
-        return int(value)
-
-    # просто "час" / "полчаса"
+    if "полтора часа" in raw or "полторы часа" in raw:
+        return 90
     if "полчаса" in raw:
         return 30
     if re.fullmatch(r"(?:за\s+)?час", raw):
         return 60
+    if "недел" in raw:
+        return 7 * 24 * 60
+    if "месяц" in raw:
+        return 30 * 24 * 60
     if "день" in raw or "сутки" in raw:
         return 24 * 60
+    if "полдня" in raw:
+        return 12 * 60
 
     # просто число -> считаем минутами
     m = re.fullmatch(r"(\d+)", raw)
     if m:
-        return int(m.group(1))
+        return min(int(m.group(1)), MAX_REMINDER_MINUTES)
 
     return None
 

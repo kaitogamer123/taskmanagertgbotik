@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import re
 from datetime import date, timedelta
 from typing import Optional
@@ -105,6 +106,12 @@ def parse_natural_date(text: str, today: Optional[date] = None) -> Optional[date
     m = re.search(r"через\s+(\d+)\s*недел", raw)
     if m:
         return today + timedelta(weeks=int(m.group(1)))
+    m = re.search(r"через\s+(\d+)\s*месяц", raw)
+    if m:
+        return _add_months(today, int(m.group(1)))
+    m = re.search(r"через\s+месяц", raw)
+    if m:
+        return _add_months(today, 1)
 
     # 3. числовой формат дд.мм, дд.мм.гг(гг), дд/мм, дд-мм
     m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b", raw)
@@ -170,7 +177,49 @@ def parse_natural_date(text: str, today: Optional[date] = None) -> Optional[date
     return None
 
 
+def _add_months(d: date, months: int) -> date:
+    """Прибавляет месяцы, подрезая день до последнего в месяце."""
+    month = d.month - 1 + months
+    year = d.year + month // 12
+    month = month % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def parse_day_month(text: str) -> Optional[tuple[int, int]]:
+    """
+    Разбирает "29 февраля", "29.02", "29/02" в (день, месяц) без привязки
+    к году. 29 февраля разрешено — используется високосный 2024 год.
+    """
+    raw = (text or "").strip().lower().replace("ё", "е")
+    if not raw:
+        return None
+
+    m = re.search(r"\b(\d{1,2})\s*[.\-/]\s*(\d{1,2})\b", raw)
+    if m:
+        day_, month_ = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(
+            r"\b(\d{1,2})\s+(" + "|".join(MONTHS_RU.keys()) + r")\b", raw
+        )
+        if not m:
+            return None
+        day_, month_ = int(m.group(1)), MONTHS_RU[m.group(2)]
+
+    if not (1 <= month_ <= 12):
+        return None
+    max_day = calendar.monthrange(2024, month_)[1]
+    if not (1 <= day_ <= max_day):
+        return None
+    return day_, month_
+
+
 TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*[:.\-\s]\s*([0-5]\d)(?!\d)")
+
+DAYPART_RE = re.compile(
+    r"(?<!\d)(\d{1,2})(?:\s*[:.\-]\s*([0-5]\d))?\s*"
+    r"(утра|утром|дня|днем|вечера|вечером|ночи|ночью)\b"
+)
 
 _NO_TIME_MARKERS = (
     "без врем",
@@ -196,6 +245,30 @@ def parse_time(text: str) -> Optional[str]:
     raw = (text or "").strip().lower().replace("ё", "е")
     if not raw or is_skip_time_phrase(raw):
         return None
+
+    if "полдень" in raw:
+        return "12:00"
+    if "полночь" in raw:
+        return "00:00"
+
+    # "9 вечера", "9:30 утра", "11 ночи"
+    m_day = DAYPART_RE.search(raw)
+    if m_day:
+        hour = int(m_day.group(1))
+        minute = int(m_day.group(2) or 0)
+        part = m_day.group(3)
+        if part.startswith("вечер") or part.startswith("дн"):
+            if 1 <= hour <= 11:
+                hour += 12
+        elif part.startswith("ноч"):
+            if hour == 12:
+                hour = 0
+            elif 6 <= hour <= 11:
+                hour += 12
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{hour:02d}:{minute:02d}"
+        return None
+
     m = TIME_RE.search(raw)
     if m:
         hour = int(m.group(1))

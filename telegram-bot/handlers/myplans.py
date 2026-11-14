@@ -20,6 +20,7 @@ from database.plans_repo import (
     delete_plan,
     delete_rule,
     exclude_rule_date,
+    get_plan_row,
     get_plans_for_date,
     get_rule_row,
     get_scheduled_days,
@@ -30,10 +31,14 @@ from keyboards.inline import (
     all_days_keyboard,
     day_delete_keyboard,
     day_plans_keyboard,
+    del_day_confirm_keyboard,
+    del_plan_confirm_keyboard,
+    del_rule_confirm_keyboard,
     global_delete_menu_keyboard,
     item_detail_keyboard,
     recur_delete_confirm_keyboard,
     reminder_choice_keyboard,
+    rules_delete_keyboard,
     week_days_keyboard,
 )
 from keyboards.reply import (
@@ -51,6 +56,7 @@ from utils.date_utils import (
 )
 from utils.reminder_utils import describe_reminder, parse_reminder_offset
 from utils.repeat_parser import describe_rule
+from utils.text import MAX_DESCRIPTION, MAX_MESSAGE, MAX_TITLE, esc
 
 router = Router(name="myplans")
 
@@ -96,7 +102,7 @@ def _day_badge(d: date, today: date) -> str:
 
 
 def build_all_days_view(
-    db: UserDB, page: int = 0, page_size: int = 10
+    db: UserDB, page: int = 0, page_size: int = 5
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """Формирует текст и клавиатуру для кнопки «В какие дни есть задачи»."""
     today = today_for_user(db)
@@ -123,12 +129,13 @@ def build_all_days_view(
             f"📅 <b>{format_date_full_ru(d)}, {weekday_name(d)}{badge}</b> "
             f"— задач: {len(items)}"
         )
-        for item in items:
+        for item in items[:6]:
             prefix = "🔁" if item.kind == "recur" else "•"
             lines.append(
-                f"   {prefix} {html.escape(item.time_label())} — "
-                f"{html.escape(item.title)}"
+                f"   {prefix} {esc(item.time_label())} — {esc(item.title, 60)}"
             )
+        if len(items) > 6:
+            lines.append(f"   … и ещё {len(items) - 6}")
         lines.append("")
 
     if max_pages > 1:
@@ -136,23 +143,57 @@ def build_all_days_view(
 
     if rules:
         lines.append("🔁 <b>Повторяющиеся задачи:</b>")
-        for r in rules:
+        for r in rules[:10]:
             t_lbl = r["time_start"] or "Без времени"
             if r["time_start"] and r["time_end"]:
                 t_lbl = f"{r['time_start']}-{r['time_end']}"
             lines.append(
-                f"   • {html.escape(t_lbl)} — <b>{html.escape(r['title'])}</b> "
-                f"({html.escape(describe_rule(r['rule_type'], r['rule_value']))})"
+                f"   • {esc(t_lbl)} — <b>{esc(r['title'], 60)}</b> "
+                f"({esc(describe_rule(r['rule_type'], r['rule_value']))})"
+            )
+        if len(rules) > 10:
+            lines.append(
+                f"   … и ещё {len(rules) - 10} (через «🗑 Удалить задачу»)"
             )
         lines.append("")
 
     lines.append("👇 Нажми на нужный день ниже, чтобы открыть его или удалить задачи:")
+
+    # Обрезаем по границам строк, чтобы не разрезать HTML-теги.
+    while len("\n".join(lines)) > MAX_MESSAGE and len(lines) > 2:
+        lines.pop()
+    lines.append("…")
     text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3980] + "\n…"
 
     kb = all_days_keyboard(days_list, today=today, page=page, page_size=page_size)
     return text, kb
+
+
+def build_rules_view(
+    db: UserDB, page: int = 0, page_size: int = 8
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Список всех повторяющихся правил с пагинацией."""
+    today = today_for_user(db)
+    _, rules = get_scheduled_days(db, today)
+    if not rules:
+        return "📭 <b>Повторяющихся задач нет.</b>", None
+
+    max_pages = max(1, (len(rules) + page_size - 1) // page_size)
+    page = max(0, min(page, max_pages - 1))
+    lines = [
+        f"🔁 <b>Все повторяющиеся задачи</b> "
+        f"(страница {page + 1} из {max_pages}):\n"
+    ]
+    for r in rules:
+        t_lbl = r["time_start"] or "без времени"
+        if r["time_start"] and r["time_end"]:
+            t_lbl = f"{r['time_start']}-{r['time_end']}"
+        lines.append(
+            f"• {esc(t_lbl)} — <b>{esc(r['title'], 60)}</b> "
+            f"({esc(describe_rule(r['rule_type'], r['rule_value']))})"
+        )
+    lines.append("\nНажми на задачу ниже, чтобы удалить все её повторения.")
+    return "\n".join(lines), rules_delete_keyboard(rules, page, page_size)
 
 
 def build_delete_menu_view(
@@ -171,7 +212,9 @@ def build_delete_menu_view(
         "🗑 <b>Удаление задач</b>\n\n"
         "Выбери день, в котором нужно удалить задачу (или удали повторяющееся правило целиком):"
     )
-    return text, global_delete_menu_keyboard(days_list, rules, today=today, page=page)
+    return text, global_delete_menu_keyboard(
+        days_list, rules, today=today, page=page, page_size=5
+    )
 
 
 # ─── /MyPlans, «Дни с задачами» и общее «Удалить задачу» ─────────────────────
@@ -276,7 +319,7 @@ def _find_item(items: list[PlanItem], kind: str, source_id: str):
 
 def _item_detail_text(target: PlanItem, reminder: str) -> str:
     description = (
-        html.escape(target.description)
+        esc(target.description, MAX_DESCRIPTION)
         if target.description
         else "Описание отсутствует"
     )
@@ -286,7 +329,7 @@ def _item_detail_text(target: PlanItem, reminder: str) -> str:
             f"\n🔁 Повторение: {html.escape(describe_rule(target.rule_type, target.rule_value))}"
         )
     return (
-        f"<b>{html.escape(target.title)}</b>\n"
+        f"<b>{esc(target.title, MAX_TITLE)}</b>\n"
         f"🕐 {html.escape(target.time_label())}{recur_line}\n\n"
         f"💬 Описание: {description}\n\n"
         f"{reminder}"
@@ -359,13 +402,13 @@ async def on_delete_item(callback: CallbackQuery, db: UserDB) -> None:
     d = datetime.strptime(iso_date, "%Y-%m-%d").date()
 
     if kind == "plan":
-        delete_plan(db, source_id)
-        await callback.answer("🗑 Задача удалена!")
-        items = get_plans_for_date(db, d)
+        plan = get_plan_row(db, source_id)
+        title = plan["title"] if plan is not None else "эту задачу"
+        await callback.answer()
         await _safe_edit(
             callback.message,
-            f"✅ Задача удалена!\n\n{build_day_text(d, items)}",
-            reply_markup=day_plans_keyboard(d, items),
+            f"🗑 Удалить задачу «<b>{esc(title, MAX_TITLE)}</b>»?",
+            reply_markup=del_plan_confirm_keyboard(d, source_id),
         )
         return
 
@@ -384,10 +427,25 @@ async def on_delete_item(callback: CallbackQuery, db: UserDB) -> None:
     await callback.answer()
     await _safe_edit(
         callback.message,
-        f"🔁 Задача <b>«{html.escape(rule['title'])}»</b> является повторяющейся "
+        f"🔁 Задача <b>«{esc(rule['title'], MAX_TITLE)}»</b> является повторяющейся "
         f"({html.escape(describe_rule(rule['rule_type'], rule['rule_value']))}).\n\n"
         "Как именно её удалить?",
         reply_markup=recur_delete_confirm_keyboard(d, source_id),
+    )
+
+
+@router.callback_query(F.data.startswith("del_plan_yes:"))
+async def on_delete_plan_yes(callback: CallbackQuery, db: UserDB) -> None:
+    _, plan_id_str, iso_date = (callback.data or "").split(":", 2)
+    plan_id = int(plan_id_str)
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    delete_plan(db, plan_id)
+    await callback.answer("🗑 Задача удалена!")
+    items = get_plans_for_date(db, d)
+    await _safe_edit(
+        callback.message,
+        f"✅ Задача удалена!\n\n{build_day_text(d, items)}",
+        reply_markup=day_plans_keyboard(d, items),
     )
 
 
@@ -429,14 +487,53 @@ async def on_delete_rule_from_global_menu(
     callback: CallbackQuery, db: UserDB
 ) -> None:
     _, rule_id_str = (callback.data or "").split(":", 1)
+    rule = get_rule_row(db, int(rule_id_str))
+    if rule is None:
+        await callback.answer("Задача уже удалена", show_alert=True)
+        return
+    await callback.answer()
+    await _safe_edit(
+        callback.message,
+        f"🗑 Удалить все повторения задачи "
+        f"«<b>{esc(rule['title'], MAX_TITLE)}</b>»?",
+        reply_markup=del_rule_confirm_keyboard(int(rule_id_str)),
+    )
+
+
+@router.callback_query(F.data.startswith("del_rule_yes:"))
+async def on_delete_rule_yes(callback: CallbackQuery, db: UserDB) -> None:
+    _, rule_id_str = (callback.data or "").split(":", 1)
     delete_rule(db, int(rule_id_str))
     await callback.answer("🗑 Повторяющаяся задача удалена!")
     text, kb = build_delete_menu_view(db, page=0)
+    await _safe_edit(callback.message, f"✅ Повторяющаяся задача удалена!\n\n{text}", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("del_rules:"))
+async def cb_delete_rules(callback: CallbackQuery, db: UserDB) -> None:
+    _, page_str = (callback.data or "").split(":", 1)
+    page = int(page_str) if page_str.isdigit() else 0
+    text, kb = build_rules_view(db, page=page)
+    await callback.answer()
     await _safe_edit(callback.message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("del_day_all:"))
 async def on_delete_all_day(callback: CallbackQuery, db: UserDB) -> None:
+    _, iso_date = (callback.data or "").split(":", 1)
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    items = get_plans_for_date(db, d)
+    await callback.answer()
+    await _safe_edit(
+        callback.message,
+        f"💥 Удалить <b>все задачи</b> на {format_date_full_ru(d)} "
+        f"({len(items)} шт.)?",
+        reply_markup=del_day_confirm_keyboard(d),
+    )
+
+
+@router.callback_query(F.data.startswith("del_day_all_yes:"))
+async def on_delete_all_day_yes(callback: CallbackQuery, db: UserDB) -> None:
     _, iso_date = (callback.data or "").split(":", 1)
     d = datetime.strptime(iso_date, "%Y-%m-%d").date()
     removed = delete_all_for_date(db, d)

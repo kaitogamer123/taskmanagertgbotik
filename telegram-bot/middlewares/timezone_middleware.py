@@ -45,14 +45,11 @@ class TimezoneGateMiddleware(BaseMiddleware):
         if is_timezone_configured(db):
             return await handler(event, data)
 
-        # Разрешаем системную команду /update владельцу даже до настройки пояса
-        if (
-            isinstance(event, Message)
-            and event.text
-            and event.text.strip().lower().startswith("/update")
-            and user.id in OWNER_IDS
-        ):
-            return await handler(event, data)
+        # Разрешаем системные команды владельцу даже до настройки пояса
+        if isinstance(event, Message) and event.text and user.id in OWNER_IDS:
+            command = event.text.strip().lower().split("@", 1)[0]
+            if command in {"/update", "/status", "/restart", "/backup"}:
+                return await handler(event, data)
 
         current_state = await state.get_state()
 

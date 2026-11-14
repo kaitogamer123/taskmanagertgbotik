@@ -12,11 +12,11 @@ from database.db_manager import UserDB
 from database.plans_repo import (
     PlanItem,
     get_plan_counts_for_dates,
-    get_plans_for_date,
 )
 from database.settings_repo import NotifySettings
 from utils.clock import format_utc_offset
 from utils.date_utils import format_date_ru, get_week_window, weekday_name
+from utils.text import clip_button
 
 
 def hour_picker_keyboard(allow_cancel: bool = False) -> InlineKeyboardMarkup:
@@ -106,9 +106,10 @@ def all_days_keyboard(
 
 def day_plans_keyboard(d: date, items: list[PlanItem]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for item in items:
+    # Telegram не любит очень много кнопок; 50 задач на день более чем достаточно
+    for item in items[:50]:
         prefix = "🔁 " if item.kind == "recur" else "🕐 "
-        label = f"{prefix}{item.time_label()} — {item.title}"
+        label = clip_button(f"{prefix}{item.time_label()} — {item.title}")
         callback_data = f"view:{item.kind}:{item.source_id}:{d.isoformat()}"
         builder.row(InlineKeyboardButton(text=label, callback_data=callback_data))
 
@@ -177,11 +178,11 @@ def recur_delete_confirm_keyboard(
 def day_delete_keyboard(d: date, items: list[PlanItem]) -> InlineKeyboardMarkup:
     """Клавиатура выбора конкретной задачи для удаления внутри выбранного дня."""
     builder = InlineKeyboardBuilder()
-    for item in items:
+    for item in items[:50]:
         prefix = "🔁" if item.kind == "recur" else "🗑"
         builder.row(
             InlineKeyboardButton(
-                text=f"{prefix} {item.time_label()} — {item.title}",
+                text=clip_button(f"{prefix} {item.time_label()} — {item.title}"),
                 callback_data=f"del_item:{item.kind}:{item.source_id}:{d.isoformat()}",
             )
         )
@@ -237,13 +238,97 @@ def global_delete_menu_keyboard(
     for rule in rules[:5]:
         builder.row(
             InlineKeyboardButton(
-                text=f"🔁 Удалить повтор: {rule['title']}",
+                text=clip_button(f"🔁 Удалить повтор: {rule['title']}"),
                 callback_data=f"del_rule_now:{rule['id']}",
+            )
+        )
+
+    if len(rules) > 5:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🔁 Все повторяющиеся ({len(rules)})",
+                callback_data="del_rules:0",
             )
         )
 
     builder.row(
         InlineKeyboardButton(text="⬅️ К неделе", callback_data="week_menu")
+    )
+    return builder.as_markup()
+
+
+def rules_delete_keyboard(
+    rules: list[sqlite3.Row], page: int = 0, page_size: int = 8
+) -> InlineKeyboardMarkup:
+    """Список всех повторяющихся правил с постраничной навигацией."""
+    builder = InlineKeyboardBuilder()
+    start_idx = page * page_size
+    end_idx = min(start_idx + page_size, len(rules))
+    for rule in rules[start_idx:end_idx]:
+        label = f"🗑 {rule['time_start'] or 'без времени'} — {rule['title']}"
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(label),
+                callback_data=f"del_rule_now:{rule['id']}",
+            )
+        )
+
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(text="⬅️", callback_data=f"del_rules:{page - 1}")
+        )
+    if end_idx < len(rules):
+        nav_row.append(
+            InlineKeyboardButton(text="➡️", callback_data=f"del_rules:{page + 1}")
+        )
+    if nav_row:
+        builder.row(*nav_row)
+
+    builder.row(
+        InlineKeyboardButton(text="⬅️ К удалению", callback_data="del_menu")
+    )
+    return builder.as_markup()
+
+
+def del_plan_confirm_keyboard(d: date, plan_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🗑 Да, удалить задачу",
+            callback_data=f"del_plan_yes:{plan_id}:{d.isoformat()}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"day:{d.isoformat()}")
+    )
+    return builder.as_markup()
+
+
+def del_day_confirm_keyboard(d: date) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="💥 Да, удалить все задачи",
+            callback_data=f"del_day_all_yes:{d.isoformat()}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"day:{d.isoformat()}")
+    )
+    return builder.as_markup()
+
+
+def del_rule_confirm_keyboard(rule_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🗑 Да, удалить все повторения",
+            callback_data=f"del_rule_yes:{rule_id}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Отмена", callback_data="del_menu")
     )
     return builder.as_markup()
 
@@ -362,5 +447,36 @@ def settings_keyboard(
             text="Выключить вечер" if settings.evening_enabled else "Включить вечер",
             callback_data="settings_toggle:evening",
         )
+    )
+
+    skip_mark = "✅" if settings.skip_empty_digest else "🚫"
+    quiet_mark = "✅" if settings.quiet_enabled else "🚫"
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🔕 Пустые сводки: {skip_mark}",
+            callback_data="settings_toggle:skip_empty",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🌙 Тихие часы: {quiet_mark} ({settings.quiet_start}–{settings.quiet_end})",
+            callback_data="settings_toggle:quiet",
+        )
+    )
+    if settings.quiet_enabled:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🌙 Начало тихих часов: {settings.quiet_start}",
+                callback_data="settings_edit:quiet_start",
+            )
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🌙 Конец тихих часов: {settings.quiet_end}",
+                callback_data="settings_edit:quiet_end",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ В меню", callback_data="week_menu")
     )
     return builder.as_markup()

@@ -115,7 +115,8 @@ def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> 
             title TEXT NOT NULL,
             description TEXT,
             reminder_minutes INTEGER,
-            reminder_sent INTEGER NOT NULL DEFAULT 0
+            reminder_sent INTEGER NOT NULL DEFAULT 0,
+            done_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS recurring_rules (
@@ -130,7 +131,8 @@ def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> 
             created_at TEXT,
             reminder_minutes INTEGER,
             last_reminder_date TEXT,
-            excluded_dates TEXT NOT NULL DEFAULT ''
+            excluded_dates TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS user_settings (
@@ -143,7 +145,12 @@ def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> 
             last_evening_sent TEXT,
             utc_offset INTEGER,
             timezone_configured INTEGER NOT NULL DEFAULT 0,
-            demo_seeded INTEGER NOT NULL DEFAULT 0
+            demo_seeded INTEGER NOT NULL DEFAULT 0,
+            blocked INTEGER NOT NULL DEFAULT 0,
+            skip_empty_digest INTEGER NOT NULL DEFAULT 0,
+            quiet_enabled INTEGER NOT NULL DEFAULT 0,
+            quiet_start TEXT NOT NULL DEFAULT '23:00',
+            quiet_end TEXT NOT NULL DEFAULT '08:00'
         );
         """
     )
@@ -168,6 +175,8 @@ def _migrate_schema(
         conn.execute(
             "ALTER TABLE plans ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0"
         )
+    if "done_at" not in plans_cols:
+        conn.execute("ALTER TABLE plans ADD COLUMN done_at TEXT")
 
     rules_cols = _table_columns(conn, "recurring_rules")
     if "reminder_minutes" not in rules_cols:
@@ -177,6 +186,10 @@ def _migrate_schema(
     if "excluded_dates" not in rules_cols:
         conn.execute(
             "ALTER TABLE recurring_rules ADD COLUMN excluded_dates TEXT NOT NULL DEFAULT ''"
+        )
+    if "active" not in rules_cols:
+        conn.execute(
+            "ALTER TABLE recurring_rules ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
         )
 
     settings_cols = _table_columns(conn, "user_settings")
@@ -189,6 +202,26 @@ def _migrate_schema(
     if "demo_seeded" not in settings_cols:
         conn.execute(
             "ALTER TABLE user_settings ADD COLUMN demo_seeded INTEGER NOT NULL DEFAULT 0"
+        )
+    if "blocked" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE user_settings ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"
+        )
+    if "skip_empty_digest" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE user_settings ADD COLUMN skip_empty_digest INTEGER NOT NULL DEFAULT 0"
+        )
+    if "quiet_enabled" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE user_settings ADD COLUMN quiet_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+    if "quiet_start" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE user_settings ADD COLUMN quiet_start TEXT NOT NULL DEFAULT '23:00'"
+        )
+    if "quiet_end" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE user_settings ADD COLUMN quiet_end TEXT NOT NULL DEFAULT '08:00'"
         )
 
     # Индексы заметно ускоряют планировщик уведомлений и выборку планов по дню
@@ -265,17 +298,98 @@ def _ensure_schema(db: UserDB, is_existing_file: bool, force: bool = False) -> N
     _SCHEMA_READY.add(db.path)
 
 
+def _rebuild_index_dict() -> dict:
+    """Собирает индекс ID→файл по всем базам в PlanesUser/."""
+    index: dict = {}
+    for path in sorted(PLANES_USER_DIR.glob("*.db")):
+        try:
+            conn = sqlite3.connect(path, timeout=5)
+            row = conn.execute("SELECT telegram_id FROM user_meta LIMIT 1").fetchone()
+            conn.close()
+        except (sqlite3.Error, OSError):
+            continue
+        if row and row[0] is not None:
+            index[str(int(row[0]))] = path.name
+    return index
+
+
+def ensure_index() -> dict:
+    """
+    Гарантирует, что _index.json содержит всех пользователей, у которых есть
+    база. Если индекс потерян/побит — пересобирает его по файлам.
+    """
+    index = _load_index()
+    rebuilt = _rebuild_index_dict()
+    # Выбрасываем записи, которые указывают на уже удалённые файлы
+    merged = {
+        key: name
+        for key, name in index.items()
+        if (PLANES_USER_DIR / name).exists()
+    }
+    merged.update(rebuilt)  # данные из файлов считаем более достоверными
+    if merged and merged != index:
+        _save_index(merged)
+    return merged
+
+
+def find_db_for_user(telegram_id: int) -> Optional[Path]:
+    """Ищет файл БД пользователя сканированием PlanesUser/ (на случай битого индекса)."""
+    for path in sorted(PLANES_USER_DIR.glob("*.db")):
+        try:
+            conn = sqlite3.connect(path, timeout=5)
+            row = conn.execute(
+                "SELECT telegram_id FROM user_meta WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            conn.close()
+        except (sqlite3.Error, OSError):
+            continue
+        if row is not None:
+            return path
+    return None
+
+
+def _unique_user_path(telegram_id: int) -> Path:
+    base = PLANES_USER_DIR / f"{telegram_id}.db"
+    path = base
+    counter = 1
+    while path.exists():
+        path = base.with_name(f"{base.stem}_{counter}{base.suffix}")
+        counter += 1
+    return path
+
+
 def ensure_user_db(
     telegram_id: int, username: Optional[str], first_name: Optional[str]
 ) -> UserDB:
     """Открывает (создавая при необходимости) базу данных пользователя."""
     path = get_db_path(telegram_id, username)
+    if not path.exists():
+        # Индекс мог устареть/потеряться — пробуем найти базу по user_meta
+        found = find_db_for_user(telegram_id)
+        if found is not None:
+            path = found
+            index = _load_index()
+            index[str(telegram_id)] = path.name
+            _save_index(index)
     is_new = not path.exists()
 
     db = UserDB(path)
     _ensure_schema(db, is_existing_file=not is_new, force=is_new)
 
     row = db.conn.execute("SELECT telegram_id FROM user_meta LIMIT 1").fetchone()
+    if row is not None and int(row["telegram_id"]) != int(telegram_id):
+        # Файл принадлежит другому пользователю (битый индекс/коллизия имён).
+        # Открываем отдельный файл, чтобы не смешать данные.
+        db.close()
+        path = _unique_user_path(telegram_id)
+        db = UserDB(path)
+        _ensure_schema(db, is_existing_file=False, force=True)
+        index = _load_index()
+        index[str(telegram_id)] = path.name
+        _save_index(index)
+        row = None
+
     if row is None:
         db.conn.execute(
             """
@@ -375,7 +489,13 @@ def open_user_db_by_id(telegram_id: int) -> Optional[UserDB]:
         return None
     path = PLANES_USER_DIR / filename
     if not path.exists():
-        return None
+        found = find_db_for_user(telegram_id)
+        if found is None:
+            return None
+        path = found
+        index = _load_index()
+        index[str(telegram_id)] = path.name
+        _save_index(index)
     db = UserDB(path)
     _ensure_schema(db, is_existing_file=True)
     return db

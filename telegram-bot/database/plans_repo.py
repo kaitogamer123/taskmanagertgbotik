@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -24,6 +25,7 @@ class PlanItem:
     reminder_minutes: Optional[int] = None
     rule_type: Optional[str] = None
     rule_value: Optional[str] = None
+    done_at: Optional[str] = None
 
     def sort_key(self):
         return (0 if self.time_start else 1, self.time_start or "99:99")
@@ -123,6 +125,9 @@ def _excluded_set(rule: sqlite3.Row) -> set[str]:
 
 
 def _rule_occurs_on(rule: sqlite3.Row, d: date) -> bool:
+    if "active" in rule.keys() and not rule["active"]:
+        return False
+
     if d.isoformat() in _excluded_set(rule):
         return False
 
@@ -145,7 +150,11 @@ def _rule_occurs_on(rule: sqlite3.Row, d: date) -> bool:
 
     if rule_type == "monthly":
         day_of_month = int(rule_value)
-        return d.day == day_of_month
+        if not 1 <= day_of_month <= 31:
+            return False
+        # 31-е число в коротких месяцах — это последний день месяца
+        last_day = calendar.monthrange(d.year, d.month)[1]
+        return d.day == min(day_of_month, last_day)
 
     if rule_type == "yearly":
         day_, month_ = (int(x) for x in rule_value.split("-"))
@@ -172,6 +181,7 @@ def get_plans_for_date(
                 title=row["title"],
                 description=row["description"],
                 reminder_minutes=row["reminder_minutes"],
+                done_at=row["done_at"],
             )
         )
 
@@ -259,9 +269,8 @@ def get_scheduled_days(
     Возвращает:
       1) отсортированный список (date, items) для всех дней, где есть задачи:
          - все даты из таблицы разовых задач `plans` (включая будущие на любой срок);
-         - плюс ближайшие `recurring_horizon_days` дней для неповторяющихся-ежедневно
-           правил (а если разовых задач нет вообще — и для ежедневных на неделю вперёд,
-           чтобы пользователь сразу видел ближайшие дни кнопками);
+         - плюс ближайшие `recurring_horizon_days` дней для всех повторяющихся
+           правил (включая ежедневные);
       2) полный список всех повторяющихся правил `recurring_rules`.
     """
     candidate_dates: set[date] = set()
@@ -276,23 +285,13 @@ def get_scheduled_days(
             continue
 
     rules = get_all_recurring_rules(db)
-    non_daily_rules = [
-        r for r in rules if not (r["rule_type"] == "interval" and r["rule_value"] == "1")
-    ]
-    daily_rules = [
-        r for r in rules if (r["rule_type"] == "interval" and r["rule_value"] == "1")
-    ]
-
-    if non_daily_rules:
+    if rules:
+        # Ежедневные и любые другие правила добавляем на весь горизонт.
+        # Раньше daily-rules терялись, если у пользователя была хоть одна
+        # разовая задача (условие `and not candidate_dates`).
         for offset in range(recurring_horizon_days):
             d = today + timedelta(days=offset)
-            if any(_rule_occurs_on(r, d) for r in non_daily_rules):
-                candidate_dates.add(d)
-
-    if daily_rules and not candidate_dates:
-        for offset in range(7):
-            d = today + timedelta(days=offset)
-            if any(_rule_occurs_on(r, d) for r in daily_rules):
+            if any(_rule_occurs_on(r, d) for r in rules):
                 candidate_dates.add(d)
 
     # Сначала показываем сегодня и будущие дни по возрастанию, затем (если остались) прошлые

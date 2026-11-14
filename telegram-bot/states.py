@@ -36,3 +36,5 @@ class ReminderEditStates(StatesGroup):
 class SettingsStates(StatesGroup):
     waiting_morning_time = State()
     waiting_evening_time = State()
+    waiting_quiet_start = State()
+    waiting_quiet_end = State()

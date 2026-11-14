@@ -177,7 +177,7 @@ async def check_and_pull_updates(force_pull: bool = False) -> PullResult:
     new_sha = remote_full[:7]
 
     # Главное: если коммит не изменился — НЕ делаем ни pull, ни reset.
-    if new_sha == old_sha:
+    if remote_full == old_full:
         return PullResult(
             updated=False,
             old_commit=old_sha,
@@ -205,16 +205,28 @@ async def check_and_pull_updates(force_pull: bool = False) -> PullResult:
     _, new_out, _ = await _run_cmd(
         ["git", "rev-parse", "HEAD"], git_root, timeout=GIT_SHORT_TIMEOUT
     )
-    new_sha = (new_out or remote_full).strip()[:7]
+    new_full = (new_out or remote_full).strip()
+    new_sha = new_full[:7]
 
-    changed = new_sha != old_sha
+    changed = new_full != old_full
     if changed:
         req_file = BASE_DIR / "requirements.txt"
         if req_file.exists():
-            await _run_cmd(
+            pip_code, _, pip_err = await _run_cmd(
                 [sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)],
                 BASE_DIR,
             )
+            if pip_code != 0:
+                return PullResult(
+                    updated=False,
+                    old_commit=old_sha,
+                    new_commit=new_sha,
+                    message=(
+                        "Код обновлён, но pip install завершился с ошибкой: "
+                        f"{pip_err or 'неизвестная ошибка'}. "
+                        "Перезапуск отменён — исправь зависимости и сделай /restart."
+                    ),
+                )
 
     return PullResult(
         updated=changed,

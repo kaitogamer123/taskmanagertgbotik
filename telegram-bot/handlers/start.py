@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from aiogram import Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
+from database.db_manager import UserDB
+from database.settings_repo import clear_user_blocked
 from keyboards.reply import main_reply_keyboard
 
 router = Router(name="start")
@@ -21,11 +23,36 @@ WELCOME_TEXT = (
     "и времени утренней/вечерней сводки\n"
     "• /database — скачать файл своей базы данных (.db)\n\n"
     "Также в любой момент можешь просто написать дату (например, <code>19.10</code> "
-    "или «в четверг»), и я сразу открою планы на этот день!"
+    "или «в четверг»), и я сразу открою планы на этот день!\n\n"
+    "Подробная справка: /help"
+)
+
+HELP_TEXT = (
+    "📖 <b>Что я умею</b>\n\n"
+    "📅 <b>Мои планы</b> — /MyPlans или просто напиши дату.\n"
+    "📋 <b>Дни с задачами</b> — /alldays.\n"
+    "➕ <b>Новая задача</b> — /NewPlan: дата, время, название, описание, напоминание.\n"
+    "🔁 <b>Повторяющаяся</b> — /everyN: каждый день, каждые N дней, по дням недели, "
+    "каждый месяц или год.\n"
+    "🗑 <b>Удалить</b> — /delete.\n"
+    "⚙️ <b>Настройки</b> — /notify: сводки, пустые сводки, тихие часы, часовой пояс.\n"
+    "🌍 <b>Часовой пояс</b> — /changeTime.\n"
+    "📂 <b>База данных</b> — /database.\n"
+    "❌ <b>Отмена</b> — /cancel.\n\n"
+    "💡 <b>Примеры дат:</b> <code>19.10</code>, <code>19.10.2026</code>, «сегодня», "
+    "«завтра», «через 3 дня», «в четверг», «на следующей неделе в среду».\n"
+    "💡 <b>Примеры времени:</b> <code>14:30</code>, <code>14</code>, «9 вечера», «9:30 утра».\n"
+    "💡 <b>Примеры напоминаний:</b> «за 30 минут», «за 1 час 30 минут», «за 2 дня»."
 )
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+async def cmd_start(message: Message, state: FSMContext, db: UserDB) -> None:
     await state.clear()
+    clear_user_blocked(db)
     await message.answer(WELCOME_TEXT, reply_markup=main_reply_keyboard())
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(HELP_TEXT, reply_markup=main_reply_keyboard())

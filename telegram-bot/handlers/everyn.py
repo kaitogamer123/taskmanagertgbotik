@@ -23,12 +23,19 @@ from utils.clock import today_for_user
 from utils.date_utils import (
     format_date_full_ru,
     is_skip_time_phrase,
+    parse_day_month,
     parse_natural_date,
     parse_time,
     weekday_name,
 )
 from utils.reminder_utils import describe_reminder, parse_reminder_offset
 from utils.repeat_parser import describe_rule, parse_repeat_phrase
+from utils.text import (
+    MAX_DESCRIPTION,
+    MAX_TITLE,
+    esc,
+    unquote_menu_literal,
+)
 
 router = Router(name="everyn")
 
@@ -42,7 +49,9 @@ async def cmd_every_n(message: Message, state: FSMContext) -> None:
         "Добавляем повторяющуюся задачу 🔁\n\n"
         "Напиши название задачи. Если хочешь добавить и описание — "
         "укажи его через вертикальную черту, например:\n"
-        "<code>Пить витамины | Утром после завтрака</code>",
+        "<code>Пить витамины | Утром после завтрака</code>\n\n"
+        f"<i>(название до {MAX_TITLE}, описание до {MAX_DESCRIPTION}; "
+        "если название совпадает с кнопкой меню — оберни его в «кавычки»)</i>",
         reply_markup=cancel_inline_keyboard(),
     )
 
@@ -53,7 +62,7 @@ async def cmd_every_n(message: Message, state: FSMContext) -> None:
     ~F.text.in_(MAIN_MENU_BUTTONS),
 )
 async def process_title(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").strip()
+    raw = unquote_menu_literal((message.text or "").strip(), MAIN_MENU_BUTTONS)
     if not raw:
         await message.answer("Название не может быть пустым, напиши ещё раз.")
         return
@@ -65,6 +74,16 @@ async def process_title(message: Message, state: FSMContext) -> None:
 
     if not title:
         await message.answer("Название не может быть пустым, напиши ещё раз.")
+        return
+    if len(title) > MAX_TITLE:
+        await message.answer(
+            f"Слишком длинное название 🙈 Максимум {MAX_TITLE} символов. Сократи."
+        )
+        return
+    if description and len(description) > MAX_DESCRIPTION:
+        await message.answer(
+            f"Слишком длинное описание 🙈 Максимум {MAX_DESCRIPTION} символов. Сократи."
+        )
         return
 
     await state.update_data(title=title, description=description)
@@ -240,9 +259,9 @@ async def process_repeat_button(
 )
 async def process_interval_value(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
-    if not text.isdigit() or int(text) <= 0:
+    if not text.isdigit() or not (1 <= int(text) <= 365):
         await message.answer(
-            "Нужно целое положительное число дней, например <code>3</code>. Попробуй ещё раз."
+            "Нужно целое число дней от 1 до 365, например <code>3</code>. Попробуй ещё раз."
         )
         return
     await _ask_start_date(message, state, "interval", text)
@@ -305,13 +324,14 @@ async def process_monthly_value(message: Message, state: FSMContext) -> None:
 async def process_yearly_value(
     message: Message, state: FSMContext, db: UserDB
 ) -> None:
-    parsed = parse_natural_date(message.text or "", today=today_for_user(db))
+    parsed = parse_day_month(message.text or "")
     if parsed is None:
         await message.answer(
-            "Не понял дату. Напиши, например: <code>1 января</code> или <code>01.01</code>."
+            "Не понял дату. Напиши, например: <code>1 января</code> или <code>29.02</code>."
         )
         return
-    await _ask_start_date(message, state, "yearly", f"{parsed.day}-{parsed.month}")
+    day, month = parsed
+    await _ask_start_date(message, state, "yearly", f"{day}-{month}")
 
 
 async def _ask_start_date(
@@ -435,12 +455,18 @@ async def _save_rule(
 
     await message.answer(
         "Готово! ✅ Повторяющаяся задача добавлена:\n\n"
-        f"📝 <b>{html.escape(title)}</b>\n"
-        f"💬 {html.escape(description) if description else 'Описание отсутствует'}\n"
+        f"📝 <b>{esc(title, MAX_TITLE)}</b>\n"
+        f"💬 {esc(description, MAX_DESCRIPTION) if description else 'Описание отсутствует'}\n"
         f"🕐 {html.escape(time_label)}\n"
         f"🔁 {html.escape(describe_rule(rule_type, rule_value))}\n"
         f"📅 Начиная с {format_date_full_ru(start_date)} ({weekday_name(start_date)})\n"
-        f"{describe_reminder(reminder_minutes)}\n\n"
+        f"{describe_reminder(reminder_minutes)}"
+        + (
+            "\n\nℹ️ В коротких месяцах задача будет в последний день."
+            if rule_type == "monthly" and int(rule_value) > 28
+            else ""
+        )
+        + "\n\n"
         "Посмотреть планы можно кнопкой «📅 Мои планы» или «📋 Дни с задачами».",
         reply_markup=main_reply_keyboard(),
     )

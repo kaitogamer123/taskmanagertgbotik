@@ -97,8 +97,8 @@ async def _apply_user_hour(
     local_now = now_for_offset(offset)
 
     # Если это совершенно новый пользователь — заполняем стартовые демо-планы
-    # строго по ЕГО реальной локальной дате!
-    if not settings.demo_seeded:
+    # строго по ЕГО реальной локальной дате! При смене пояса демо не подсыпаем.
+    if first_setup and not settings.demo_seeded:
         seed_demo_data(db.conn, today=local_now.date())
         mark_demo_seeded(db)
 

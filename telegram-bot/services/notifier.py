@@ -7,18 +7,28 @@
   2) отправляет вечернюю сводку (планы на завтра) в настроенное время;
   3) отправляет напоминания "через N у тебя задача ..." для разовых и
      повторяющихся задач, у которых настроено напоминание.
+
+Учитывает:
+  * тихие часы (напоминания переносятся на утро);
+  * пустые сводки (можно отключить);
+  * заблокировавших бота пользователей;
+  * TelegramRetryAfter (flood control);
+  * напоминания повторяющихся задач за любое число дней (не только 0/1).
 """
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Optional
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramForbiddenError, TelegramNotFound
+from aiogram.exceptions import (
+    TelegramForbiddenError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+)
 
 from config import NOTIFIER_POLL_INTERVAL
 from database.db_manager import UserDB, iter_all_user_ids, open_user_db_by_id
@@ -28,10 +38,12 @@ from database.settings_repo import (
     get_settings,
     mark_evening_sent,
     mark_morning_sent,
+    mark_user_blocked,
 )
 from utils.clock import now_for_offset
 from utils.date_utils import format_date_full_ru, weekday_name
 from utils.reminder_utils import format_minutes_label
+from utils.text import MAX_TITLE, esc, paginate_lines
 
 logger = logging.getLogger(__name__)
 
@@ -40,33 +52,54 @@ logger = logging.getLogger(__name__)
 GRACE_WINDOW = timedelta(minutes=15)
 
 
-def _digest_body(items: list[PlanItem]) -> str:
+class UserBlocked(Exception):
+    """Пользователь заблокировал бота — прекращаем обработку до следующего тика."""
+
+
+def _digest_lines(items: list[PlanItem]) -> list[str]:
     if not items:
-        return "На этот день пока ничего не запланировано 🙂"
-    lines = []
-    for item in items:
-        lines.append(f"🕐 {html.escape(item.time_label())} — {html.escape(item.title)}")
-    return "\n".join(lines)
+        return ["На этот день пока ничего не запланировано 🙂"]
+    return [
+        f"🕐 {esc(item.time_label())} — {esc(item.title, MAX_TITLE)}"
+        for item in items
+    ]
 
 
-async def _send_morning_digest(bot: Bot, telegram_id: int, db: UserDB, today: date) -> None:
-    items = get_plans_for_date(db, today)
-    text = (
+async def _send_with_retry(bot: Bot, chat_id: int, text: str) -> None:
+    try:
+        await bot.send_message(chat_id, text)
+    except TelegramRetryAfter as exc:
+        # Flood control: ждём столько, сколько просит Telegram (но не бесконечно)
+        await asyncio.sleep(min(exc.retry_after, 30) + 1)
+        await bot.send_message(chat_id, text)
+
+
+async def _send_chunks(
+    bot: Bot, chat_id: int, header: str, lines: list[str]
+) -> None:
+    for chunk in paginate_lines([header] + lines):
+        if chunk.strip():
+            await _send_with_retry(bot, chat_id, chunk)
+
+
+async def _send_morning_digest(
+    bot: Bot, telegram_id: int, items: list[PlanItem], today: date
+) -> None:
+    header = (
         f"🌅 Доброе утро! Вот что запланировано на сегодня, "
-        f"<b>{format_date_full_ru(today)} ({weekday_name(today)})</b>:\n\n"
-        f"{_digest_body(items)}"
+        f"<b>{format_date_full_ru(today)} ({weekday_name(today)})</b>:\n"
     )
-    await bot.send_message(telegram_id, text)
+    await _send_chunks(bot, telegram_id, header, _digest_lines(items))
 
 
-async def _send_evening_digest(bot: Bot, telegram_id: int, db: UserDB, tomorrow: date) -> None:
-    items = get_plans_for_date(db, tomorrow)
-    text = (
+async def _send_evening_digest(
+    bot: Bot, telegram_id: int, items: list[PlanItem], tomorrow: date
+) -> None:
+    header = (
         f"🌙 Добрый вечер! Вот что запланировано на завтра, "
-        f"<b>{format_date_full_ru(tomorrow)} ({weekday_name(tomorrow)})</b>:\n\n"
-        f"{_digest_body(items)}"
+        f"<b>{format_date_full_ru(tomorrow)} ({weekday_name(tomorrow)})</b>:\n"
     )
-    await bot.send_message(telegram_id, text)
+    await _send_chunks(bot, telegram_id, header, _digest_lines(items))
 
 
 def _parse_hhmm(value: str) -> Optional[tuple[int, int]]:
@@ -77,6 +110,61 @@ def _parse_hhmm(value: str) -> Optional[tuple[int, int]]:
         return None
 
 
+def _quiet_bounds(settings: NotifySettings) -> Optional[tuple[dtime, dtime]]:
+    if not settings.quiet_enabled:
+        return None
+    start = _parse_hhmm(settings.quiet_start)
+    end = _parse_hhmm(settings.quiet_end)
+    if not start or not end:
+        return None
+    return dtime(start[0], start[1]), dtime(end[0], end[1])
+
+
+def _time_in_quiet(t: dtime, start: dtime, end: dtime) -> bool:
+    if start == end:
+        return False
+    if start < end:
+        return start <= t < end
+    return t >= start or t < end
+
+
+def _adjust_for_quiet(target: datetime, settings: NotifySettings) -> datetime:
+    """Если время попадает в тихие часы — переносим на их окончание."""
+    bounds = _quiet_bounds(settings)
+    if bounds is None:
+        return target
+    start, end = bounds
+    if not _time_in_quiet(target.time(), start, end):
+        return target
+    adjusted = target.replace(
+        hour=end.hour, minute=end.minute, second=0, microsecond=0
+    )
+    if adjusted <= target:
+        adjusted += timedelta(days=1)
+    return adjusted
+
+
+def _reminder_text(title: str, now: datetime, start_dt: datetime) -> str:
+    delta_minutes = int((start_dt - now).total_seconds() // 60)
+    safe_title = esc(title, MAX_TITLE)
+    if delta_minutes > 0:
+        return (
+            f"⏰ Через {format_minutes_label(delta_minutes)} у тебя задача "
+            f"«<b>{safe_title}</b>»!"
+        )
+    if now - start_dt <= GRACE_WINDOW:
+        return f"⏰ Задача «<b>{safe_title}</b>» начинается сейчас!"
+    return f"⏰ Задача «<b>{safe_title}</b>» уже началась."
+
+
+def _reminder_horizon_days(minutes: int) -> int:
+    """Сколько дней вперёд проверять повторяющиеся задачи для напоминания."""
+    if minutes <= 0:
+        return 1
+    days = (minutes + 1439) // 1440 + 1
+    return max(1, min(days, 14))
+
+
 async def _check_daily_digests(
     bot: Bot,
     telegram_id: int,
@@ -85,6 +173,7 @@ async def _check_daily_digests(
     settings: NotifySettings,
 ) -> None:
     today_iso = now.date().isoformat()
+    today = now.date()
 
     if settings.morning_enabled and settings.last_morning_sent != today_iso:
         parsed = _parse_hhmm(settings.morning_time)
@@ -92,10 +181,13 @@ async def _check_daily_digests(
             hh, mm = parsed
             target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if target <= now <= target + GRACE_WINDOW:
-                try:
-                    await _send_morning_digest(bot, telegram_id, db, now.date())
-                except (TelegramForbiddenError, TelegramNotFound):
-                    pass
+                items = get_plans_for_date(db, today)
+                if not (settings.skip_empty_digest and not items):
+                    try:
+                        await _send_morning_digest(bot, telegram_id, items, today)
+                    except (TelegramForbiddenError, TelegramNotFound):
+                        mark_user_blocked(db.conn)
+                        raise UserBlocked
                 mark_morning_sent(db.conn, today_iso)
 
     if settings.evening_enabled and settings.last_evening_sent != today_iso:
@@ -104,14 +196,24 @@ async def _check_daily_digests(
             hh, mm = parsed
             target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if target <= now <= target + GRACE_WINDOW:
-                try:
-                    await _send_evening_digest(bot, telegram_id, db, now.date() + timedelta(days=1))
-                except (TelegramForbiddenError, TelegramNotFound):
-                    pass
+                tomorrow = today + timedelta(days=1)
+                items = get_plans_for_date(db, tomorrow)
+                if not (settings.skip_empty_digest and not items):
+                    try:
+                        await _send_evening_digest(bot, telegram_id, items, tomorrow)
+                    except (TelegramForbiddenError, TelegramNotFound):
+                        mark_user_blocked(db.conn)
+                        raise UserBlocked
                 mark_evening_sent(db.conn, today_iso)
 
 
-async def _check_plan_reminders(bot: Bot, telegram_id: int, db: UserDB, now: datetime) -> None:
+async def _check_plan_reminders(
+    bot: Bot,
+    telegram_id: int,
+    db: UserDB,
+    now: datetime,
+    settings: NotifySettings,
+) -> None:
     rows = db.conn.execute(
         """
         SELECT id, plan_date, time_start, title, reminder_minutes FROM plans
@@ -122,6 +224,7 @@ async def _check_plan_reminders(bot: Bot, telegram_id: int, db: UserDB, now: dat
         """
     ).fetchall()
 
+    changed = False
     for row in rows:
         try:
             plan_date = date.fromisoformat(row["plan_date"])
@@ -129,21 +232,43 @@ async def _check_plan_reminders(bot: Bot, telegram_id: int, db: UserDB, now: dat
         except (ValueError, AttributeError):
             continue
 
-        start_dt = datetime.combine(plan_date, datetime.min.time()).replace(hour=hh, minute=mm)
+        start_dt = datetime.combine(plan_date, datetime.min.time()).replace(
+            hour=hh, minute=mm
+        )
         target_dt = start_dt - timedelta(minutes=row["reminder_minutes"] or 0)
+        target_dt = _adjust_for_quiet(target_dt, settings)
+
+        # Просроченное напоминание больше не сканируем каждый тик
+        if now > target_dt + GRACE_WINDOW:
+            db.conn.execute(
+                "UPDATE plans SET reminder_sent = 1 WHERE id = ?", (row["id"],)
+            )
+            changed = True
+            continue
 
         if target_dt <= now <= target_dt + GRACE_WINDOW:
-            label = format_minutes_label(_remaining_minutes(now, start_dt))
-            text = f'⏰ Через {label} у тебя задача «<b>{html.escape(row["title"])}</b>»!'
+            text = _reminder_text(row["title"], now, start_dt)
             try:
-                await bot.send_message(telegram_id, text)
+                await _send_with_retry(bot, telegram_id, text)
             except (TelegramForbiddenError, TelegramNotFound):
-                pass
-            db.conn.execute("UPDATE plans SET reminder_sent = 1 WHERE id = ?", (row["id"],))
-            db.conn.commit()
+                mark_user_blocked(db.conn)
+                raise UserBlocked
+            db.conn.execute(
+                "UPDATE plans SET reminder_sent = 1 WHERE id = ?", (row["id"],)
+            )
+            changed = True
+
+    if changed:
+        db.conn.commit()
 
 
-async def _check_rule_reminders(bot: Bot, telegram_id: int, db: UserDB, now: datetime) -> None:
+async def _check_rule_reminders(
+    bot: Bot,
+    telegram_id: int,
+    db: UserDB,
+    now: datetime,
+    settings: NotifySettings,
+) -> None:
     rows = db.conn.execute(
         """
         SELECT * FROM recurring_rules
@@ -153,39 +278,43 @@ async def _check_rule_reminders(bot: Bot, telegram_id: int, db: UserDB, now: dat
         """
     ).fetchall()
 
+    changed = False
     for row in rows:
-        for offset_days in (0, 1):
+        try:
+            hh, mm = (int(x) for x in row["time_start"].split(":"))
+        except (ValueError, AttributeError):
+            continue
+
+        horizon = _reminder_horizon_days(int(row["reminder_minutes"] or 0))
+        for offset_days in range(horizon):
             candidate_date = now.date() + timedelta(days=offset_days)
             if row["last_reminder_date"] == candidate_date.isoformat():
                 continue
             if not _rule_occurs_on(row, candidate_date):
                 continue
-            try:
-                hh, mm = (int(x) for x in row["time_start"].split(":"))
-            except (ValueError, AttributeError):
-                continue
 
-            start_dt = datetime.combine(candidate_date, datetime.min.time()).replace(hour=hh, minute=mm)
+            start_dt = datetime.combine(
+                candidate_date, datetime.min.time()
+            ).replace(hour=hh, minute=mm)
             target_dt = start_dt - timedelta(minutes=row["reminder_minutes"] or 0)
+            target_dt = _adjust_for_quiet(target_dt, settings)
 
             if target_dt <= now <= target_dt + GRACE_WINDOW:
-                label = format_minutes_label(_remaining_minutes(now, start_dt))
-                text = f'⏰ Через {label} у тебя задача «<b>{html.escape(row["title"])}</b>»!'
+                text = _reminder_text(row["title"], now, start_dt)
                 try:
-                    await bot.send_message(telegram_id, text)
+                    await _send_with_retry(bot, telegram_id, text)
                 except (TelegramForbiddenError, TelegramNotFound):
-                    pass
+                    mark_user_blocked(db.conn)
+                    raise UserBlocked
                 db.conn.execute(
                     "UPDATE recurring_rules SET last_reminder_date = ? WHERE id = ?",
                     (candidate_date.isoformat(), row["id"]),
                 )
-                db.conn.commit()
+                changed = True
+                break
 
-
-def _remaining_minutes(now: datetime, start_dt: datetime) -> int:
-    delta = start_dt - now
-    minutes = int(delta.total_seconds() // 60)
-    return max(minutes, 0)
+    if changed:
+        db.conn.commit()
 
 
 async def _process_user(bot: Bot, telegram_id: int) -> None:
@@ -193,25 +322,31 @@ async def _process_user(bot: Bot, telegram_id: int) -> None:
     if db is None:
         return
     try:
-        # Настройки читаем один раз за тик, а не отдельным запросом
-        # в каждой из проверок (раньше было 2 запроса только за время).
         settings = get_settings(db)
+        if settings.blocked:
+            return
         if settings.timezone_configured and settings.utc_offset is not None:
             user_now = now_for_offset(int(settings.utc_offset))
         else:
             user_now = now_for_offset(None)
 
         await _check_daily_digests(bot, telegram_id, db, user_now, settings)
-        await _check_plan_reminders(bot, telegram_id, db, user_now)
-        await _check_rule_reminders(bot, telegram_id, db, user_now)
+        await _check_plan_reminders(bot, telegram_id, db, user_now, settings)
+        await _check_rule_reminders(bot, telegram_id, db, user_now, settings)
+    except UserBlocked:
+        logger.info("Пользователь %s заблокировал бота — пропускаем", telegram_id)
     except Exception:  # noqa: BLE001 - один сбой не должен останавливать весь цикл
-        logger.exception("Ошибка при обработке уведомлений для пользователя %s", telegram_id)
+        logger.exception(
+            "Ошибка при обработке уведомлений для пользователя %s", telegram_id
+        )
     finally:
         db.close()
 
 
 async def run_notifier(bot: Bot) -> None:
-    logger.info("Планировщик уведомлений запущен (интервал %s сек.)", NOTIFIER_POLL_INTERVAL)
+    logger.info(
+        "Планировщик уведомлений запущен (интервал %s сек.)", NOTIFIER_POLL_INTERVAL
+    )
     while True:
         started = time.monotonic()
         try:

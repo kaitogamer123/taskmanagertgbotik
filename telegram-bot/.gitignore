@@ -27,3 +27,4 @@ __pycache__/
 # 6. Логи бота
 *.log
 logs/
+bot.pid

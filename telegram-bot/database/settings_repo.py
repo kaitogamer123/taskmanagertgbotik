@@ -19,6 +19,11 @@ class NotifySettings:
     utc_offset: Optional[int]
     timezone_configured: bool
     demo_seeded: bool
+    blocked: bool
+    skip_empty_digest: bool
+    quiet_enabled: bool
+    quiet_start: str
+    quiet_end: str
 
 
 def get_settings(db: UserDB) -> NotifySettings:
@@ -26,7 +31,8 @@ def get_settings(db: UserDB) -> NotifySettings:
         """
         SELECT morning_enabled, morning_time, evening_enabled, evening_time,
                last_morning_sent, last_evening_sent,
-               utc_offset, timezone_configured, demo_seeded
+               utc_offset, timezone_configured, demo_seeded,
+               blocked, skip_empty_digest, quiet_enabled, quiet_start, quiet_end
         FROM user_settings WHERE id = 1
         """
     ).fetchone()
@@ -46,6 +52,11 @@ def get_settings(db: UserDB) -> NotifySettings:
         utc_offset=row["utc_offset"] if row["utc_offset"] is not None else None,
         timezone_configured=bool(row["timezone_configured"]),
         demo_seeded=bool(row["demo_seeded"]),
+        blocked=bool(row["blocked"]),
+        skip_empty_digest=bool(row["skip_empty_digest"]),
+        quiet_enabled=bool(row["quiet_enabled"]),
+        quiet_start=row["quiet_start"] or "23:00",
+        quiet_end=row["quiet_end"] or "08:00",
     )
 
 
@@ -110,3 +121,45 @@ def mark_evening_sent(conn: sqlite3.Connection, today_iso: str) -> None:
         "UPDATE user_settings SET last_evening_sent = ? WHERE id = 1", (today_iso,)
     )
     conn.commit()
+
+
+def mark_user_blocked(conn: sqlite3.Connection) -> None:
+    """Пользователь заблокировал бота — больше не пытаемся ему писать."""
+    conn.execute("UPDATE user_settings SET blocked = 1 WHERE id = 1")
+    conn.commit()
+
+
+def clear_user_blocked(db: UserDB) -> None:
+    """Пользователь снова написал боту — снимаем флаг блокировки."""
+    db.conn.execute("UPDATE user_settings SET blocked = 0 WHERE id = 1")
+    db.conn.commit()
+
+
+def set_skip_empty_digest(db: UserDB, enabled: bool) -> None:
+    db.conn.execute(
+        "UPDATE user_settings SET skip_empty_digest = ? WHERE id = 1",
+        (1 if enabled else 0,),
+    )
+    db.conn.commit()
+
+
+def set_quiet_hours(
+    db: UserDB,
+    enabled: bool | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> None:
+    if enabled is not None:
+        db.conn.execute(
+            "UPDATE user_settings SET quiet_enabled = ? WHERE id = 1",
+            (1 if enabled else 0,),
+        )
+    if start is not None:
+        db.conn.execute(
+            "UPDATE user_settings SET quiet_start = ? WHERE id = 1", (start,)
+        )
+    if end is not None:
+        db.conn.execute(
+            "UPDATE user_settings SET quiet_end = ? WHERE id = 1", (end,)
+        )
+    db.conn.commit()
