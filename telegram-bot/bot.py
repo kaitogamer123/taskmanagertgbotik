@@ -33,6 +33,7 @@ from handlers import (
     myplans,
     newplan,
     notes,
+    quick_add,
     settings,
     snooze,
     start,
@@ -121,6 +122,7 @@ async def set_bot_commands(bot: Bot) -> None:
                 BotCommand(command="myplans", description="Планы на ближайшую неделю"),
                 BotCommand(command="alldays", description="В какие дни есть задачи"),
                 BotCommand(command="newplan", description="Добавить новую задачу"),
+                BotCommand(command="add", description="Быстро добавить задачу строкой"),
                 BotCommand(command="everyn", description="Добавить повторяющуюся задачу"),
                 BotCommand(command="notes", description="Заметки и папки"),
                 BotCommand(command="find", description="Поиск по задачам и заметкам"),
@@ -202,6 +204,7 @@ async def main() -> None:
     dp.include_router(database_cmd.router)
     dp.include_router(settings.router)
     dp.include_router(newplan.router)
+    dp.include_router(quick_add.router)
     dp.include_router(everyn.router)
     dp.include_router(notes.router)
     dp.include_router(snooze.router)
