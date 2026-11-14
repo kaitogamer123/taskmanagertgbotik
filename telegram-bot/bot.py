@@ -30,6 +30,7 @@ from handlers import (
     database_cmd,
     everyn,
     feedback,
+    guide,
     myplans,
     newplan,
     notes,
@@ -119,7 +120,8 @@ async def set_bot_commands(bot: Bot) -> None:
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Начало работы с ботом"),
-                BotCommand(command="help", description="Справка и примеры"),
+                BotCommand(command="help", description="Полная справка по боту"),
+                BotCommand(command="guide", description="Инструкция по разделам"),
                 BotCommand(command="myplans", description="Активные планы"),
                 BotCommand(command="history", description="История планов"),
                 BotCommand(command="alldays", description="Активные дни с задачами"),
@@ -204,6 +206,7 @@ async def main() -> None:
     dp.include_router(system_cmd.router)
     dp.include_router(broadcast.router)
     dp.include_router(feedback.router)
+    dp.include_router(guide.router)
     dp.include_router(timezone_cmd.router)
     dp.include_router(start.router)
     dp.include_router(database_cmd.router)

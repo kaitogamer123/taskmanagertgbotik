@@ -51,6 +51,12 @@ class TimezoneGateMiddleware(BaseMiddleware):
         if is_timezone_configured(db):
             return await handler(event, data)
 
+        # Справку можно читать даже до настройки пояса
+        if isinstance(event, Message) and event.text:
+            command = event.text.strip().lower().split("@", 1)[0]
+            if command in {"/help", "/guide"}:
+                return await handler(event, data)
+
         # Системные команды владельца доступны до настройки пояса
         if isinstance(event, Message) and event.text and user.id in OWNER_IDS:
             command = event.text.strip().lower().split("@", 1)[0]
