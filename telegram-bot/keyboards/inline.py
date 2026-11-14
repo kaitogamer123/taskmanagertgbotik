@@ -16,7 +16,7 @@ from database.plans_repo import (
 from database.settings_repo import NotifySettings
 from utils.clock import format_utc_offset
 from utils.date_utils import format_date_ru, get_week_window, weekday_name
-from utils.text import clip_button
+from utils.text import clip, clip_button
 
 
 def hour_picker_keyboard(allow_cancel: bool = False) -> InlineKeyboardMarkup:
@@ -56,6 +56,9 @@ def week_days_keyboard(
         InlineKeyboardButton(
             text="📋 В какие дни есть задачи", callback_data="all_days:0"
         )
+    )
+    builder.row(
+        InlineKeyboardButton(text="📊 Статистика", callback_data="stats")
     )
     builder.row(
         InlineKeyboardButton(text="🗑 Удалить задачу", callback_data="del_menu"),
@@ -108,7 +111,12 @@ def day_plans_keyboard(d: date, items: list[PlanItem]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     # Telegram не любит очень много кнопок; 50 задач на день более чем достаточно
     for item in items[:50]:
-        prefix = "🔁 " if item.kind == "recur" else "🕐 "
+        if item.done_at:
+            prefix = "✅ "
+        elif item.kind == "recur":
+            prefix = "🔁 "
+        else:
+            prefix = "🕐 "
         label = clip_button(f"{prefix}{item.time_label()} — {item.title}")
         callback_data = f"view:{item.kind}:{item.source_id}:{d.isoformat()}"
         builder.row(InlineKeyboardButton(text=label, callback_data=callback_data))
@@ -135,6 +143,19 @@ def day_plans_keyboard(d: date, items: list[PlanItem]) -> InlineKeyboardMarkup:
 
 def item_detail_keyboard(d: date, item: PlanItem) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    done_label = "↩️ Вернуть" if item.done_at else "✅ Готово"
+    builder.row(
+        InlineKeyboardButton(
+            text=done_label,
+            callback_data=f"toggle_done:{item.kind}:{item.source_id}:{d.isoformat()}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="✏️ Редактировать",
+            callback_data=f"edit_menu:{item.kind}:{item.source_id}:{d.isoformat()}",
+        )
+    )
     builder.row(
         InlineKeyboardButton(
             text="⏰ Изменить время оповещения",
@@ -149,6 +170,36 @@ def item_detail_keyboard(d: date, item: PlanItem) -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"day:{d.isoformat()}")
+    )
+    return builder.as_markup()
+
+
+def edit_item_keyboard(d: date, item: PlanItem) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    base = f"edit_field:{item.kind}:{item.source_id}:{d.isoformat()}"
+    builder.row(
+        InlineKeyboardButton(text="📝 Название", callback_data=f"{base}:title")
+    )
+    builder.row(
+        InlineKeyboardButton(text="💬 Описание", callback_data=f"{base}:description")
+    )
+    if item.kind == "plan":
+        builder.row(
+            InlineKeyboardButton(text="📅 Дата", callback_data=f"{base}:date")
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(text="📅 С даты", callback_data=f"{base}:start_date")
+        )
+    builder.row(
+        InlineKeyboardButton(text="🕐 Начало", callback_data=f"{base}:time_start"),
+        InlineKeyboardButton(text="🏁 Окончание", callback_data=f"{base}:time_end"),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=f"view:{item.kind}:{item.source_id}:{d.isoformat()}",
+        )
     )
     return builder.as_markup()
 
@@ -265,12 +316,16 @@ def rules_delete_keyboard(
     start_idx = page * page_size
     end_idx = min(start_idx + page_size, len(rules))
     for rule in rules[start_idx:end_idx]:
-        label = f"🗑 {rule['time_start'] or 'без времени'} — {rule['title']}"
+        mark = "⏸" if rule["active"] else "▶️"
         builder.row(
             InlineKeyboardButton(
-                text=clip_button(label),
+                text=clip_button(f"{mark} {rule['title']}"),
+                callback_data=f"rule_toggle:{rule['id']}:{page}",
+            ),
+            InlineKeyboardButton(
+                text="🗑",
                 callback_data=f"del_rule_now:{rule['id']}",
-            )
+            ),
         )
 
     nav_row: list[InlineKeyboardButton] = []
@@ -478,5 +533,199 @@ def settings_keyboard(
         )
     builder.row(
         InlineKeyboardButton(text="⬅️ В меню", callback_data="week_menu")
+    )
+    return builder.as_markup()
+
+
+# ─── Заметки ─────────────────────────────────────────────────────────────────
+
+
+def notes_folders_keyboard(folders: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📂 Все заметки", callback_data="notes_page:-1:0")
+    )
+    for folder in folders[:20]:
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(f"📁 {folder['name']} ({folder['note_count']})"),
+                callback_data=f"notes_page:{folder['id']}:0",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="📁 Без папки", callback_data="notes_page:0:0")
+    )
+    builder.row(
+        InlineKeyboardButton(text="➕ Новая заметка", callback_data="note_new:-1"),
+        InlineKeyboardButton(text="📁 Новая папка", callback_data="note_folder_new"),
+    )
+    builder.row(InlineKeyboardButton(text="🔎 Поиск", callback_data="note_search"))
+    builder.row(
+        InlineKeyboardButton(text="⬅️ В меню", callback_data="week_menu")
+    )
+    return builder.as_markup()
+
+
+def notes_list_keyboard(
+    notes: list,
+    folder_id: int,
+    page: int,
+    page_size: int = 5,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    start = page * page_size
+    for note in notes[start : start + page_size]:
+        date_part = (note.updated_at or "")[:10]
+        label = f"📝 {clip(note.display_title, 40)}"
+        if date_part:
+            label += f" • {date_part}"
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(label), callback_data=f"note:{note.id}"
+            )
+        )
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text="⬅️", callback_data=f"notes_page:{folder_id}:{page - 1}"
+            )
+        )
+    if start + page_size < len(notes):
+        nav.append(
+            InlineKeyboardButton(
+                text="➡️", callback_data=f"notes_page:{folder_id}:{page + 1}"
+            )
+        )
+    if nav:
+        builder.row(*nav)
+
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ Новая заметка", callback_data=f"note_new:{folder_id}"
+        ),
+        InlineKeyboardButton(text="⬅️ К папкам", callback_data="notes_menu"),
+    )
+    return builder.as_markup()
+
+
+def note_card_keyboard(note, folder_id: int = -1) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for item in note.items[:10]:
+        mark = "✅" if item["done"] else "⬜"
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(f"{mark} {item['text']}"),
+                callback_data=f"note_item:{item['id']}:{note.id}",
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(text="✏️ Текст", callback_data=f"note_text:{note.id}"),
+        InlineKeyboardButton(
+            text="📝 Заголовок", callback_data=f"note_title:{note.id}"
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="☑️ + Пункт", callback_data=f"note_item_add:{note.id}"
+        ),
+        InlineKeyboardButton(
+            text="📎 + Файл", callback_data=f"note_file_add:{note.id}"
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📁 Папка", callback_data=f"note_move:{note.id}"),
+        InlineKeyboardButton(text="📅 Дата", callback_data=f"note_date:{note.id}"),
+    )
+    if note.files:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📎 Показать файлы ({len(note.files)})",
+                callback_data=f"note_files:{note.id}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="📤 Экспорт", callback_data=f"note_export:{note.id}"
+        ),
+        InlineKeyboardButton(
+            text="🗑 Удалить", callback_data=f"note_delete:{note.id}"
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ К списку", callback_data=f"notes_page:{folder_id}:0"
+        )
+    )
+    return builder.as_markup()
+
+
+def note_move_keyboard(note_id: int, folders: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="📁 Без папки", callback_data=f"note_move_to:{note_id}:0"
+        )
+    )
+    for folder in folders[:20]:
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(f"📁 {folder['name']}"),
+                callback_data=f"note_move_to:{note_id}:{folder['id']}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"note:{note_id}")
+    )
+    return builder.as_markup()
+
+
+def note_delete_confirm_keyboard(note_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🗑 Да, удалить заметку",
+            callback_data=f"note_delete_yes:{note_id}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"note:{note_id}")
+    )
+    return builder.as_markup()
+
+
+def note_date_keyboard(note_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="📅 Убрать дату", callback_data=f"note_date_clear:{note_id}"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_flow")
+    )
+    return builder.as_markup()
+
+
+def snooze_keyboard(
+    kind: str, source_id: int, occurrence_date: str | None = None
+) -> InlineKeyboardMarkup:
+    date_part = occurrence_date or "-"
+    builder = InlineKeyboardBuilder()
+    for label, minutes in (("+10 мин", 10), ("+30 мин", 30), ("+1 час", 60)):
+        builder.button(
+            text=label,
+            callback_data=f"snz:{kind}:{source_id}:{date_part}:{minutes}",
+        )
+    builder.adjust(3)
+    return builder.as_markup()
+
+
+def stats_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="⬅️ К неделе", callback_data="week_menu")
     )
     return builder.as_markup()

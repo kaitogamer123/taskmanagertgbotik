@@ -10,6 +10,8 @@ BTN_NEW_PLAN = "➕ Новая задача"
 BTN_EVERY_N = "🔁 Повторяющаяся"
 BTN_DELETE_TASK = "🗑 Удалить задачу"
 BTN_TIME_SETTINGS = "⚙️ Настройка времени"
+BTN_NOTES = "📝 Заметки"
+BTN_FEEDBACK = "💬 Обратная связь"
 
 MAIN_MENU_BUTTONS = {
     BTN_MY_PLANS,
@@ -18,6 +20,8 @@ MAIN_MENU_BUTTONS = {
     BTN_EVERY_N,
     BTN_DELETE_TASK,
     BTN_TIME_SETTINGS,
+    BTN_NOTES,
+    BTN_FEEDBACK,
 }
 
 
@@ -29,5 +33,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     builder.button(text=BTN_EVERY_N)
     builder.button(text=BTN_DELETE_TASK)
     builder.button(text=BTN_TIME_SETTINGS)
+    builder.button(text=BTN_NOTES)
+    builder.button(text=BTN_FEEDBACK)
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)

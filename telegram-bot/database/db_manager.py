@@ -152,6 +152,66 @@ def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> 
             quiet_start TEXT NOT NULL DEFAULT '23:00',
             quiet_end TEXT NOT NULL DEFAULT '08:00'
         );
+
+        CREATE TABLE IF NOT EXISTS note_folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            created_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_note_folders_name
+            ON note_folders(name COLLATE NOCASE);
+
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_id INTEGER,
+            title TEXT,
+            body TEXT NOT NULL DEFAULT '',
+            note_date TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder_id);
+
+        CREATE TABLE IF NOT EXISTS note_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            position INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_items_note ON note_items(note_id);
+
+        CREATE TABLE IF NOT EXISTS note_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id INTEGER NOT NULL,
+            file_id TEXT NOT NULL,
+            file_unique_id TEXT,
+            file_type TEXT NOT NULL,
+            file_name TEXT,
+            caption TEXT,
+            message_id INTEGER,
+            chat_id INTEGER,
+            created_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_files_note ON note_files(note_id);
+
+        CREATE TABLE IF NOT EXISTS rule_completions (
+            rule_id INTEGER NOT NULL,
+            occurrence_date TEXT NOT NULL,
+            done_at TEXT NOT NULL,
+            PRIMARY KEY (rule_id, occurrence_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS snoozes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            source_id INTEGER NOT NULL,
+            occurrence_date TEXT,
+            title TEXT NOT NULL,
+            start_time TEXT,
+            remind_at TEXT NOT NULL,
+            created_at TEXT
+        );
         """
     )
     conn.commit()

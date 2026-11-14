@@ -16,6 +16,10 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from database.db_manager import UserDB
 from database.plans_repo import (
     PlanItem,
+    count_active_plans,
+    count_active_rules,
+    count_done_plans,
+    count_done_rules,
     delete_all_for_date,
     delete_plan,
     delete_rule,
@@ -24,21 +28,29 @@ from database.plans_repo import (
     get_plans_for_date,
     get_rule_row,
     get_scheduled_days,
+    toggle_plan_done,
+    toggle_rule_active,
+    toggle_rule_done,
+    update_plan,
     update_plan_reminder,
+    update_rule,
     update_rule_reminder,
 )
 from keyboards.inline import (
     all_days_keyboard,
+    cancel_inline_keyboard,
     day_delete_keyboard,
     day_plans_keyboard,
     del_day_confirm_keyboard,
     del_plan_confirm_keyboard,
     del_rule_confirm_keyboard,
+    edit_item_keyboard,
     global_delete_menu_keyboard,
     item_detail_keyboard,
     recur_delete_confirm_keyboard,
     reminder_choice_keyboard,
     rules_delete_keyboard,
+    stats_keyboard,
     week_days_keyboard,
 )
 from keyboards.reply import (
@@ -47,16 +59,24 @@ from keyboards.reply import (
     BTN_MY_PLANS,
     MAIN_MENU_BUTTONS,
 )
-from states import ReminderEditStates
+from states import PlanEditStates, ReminderEditStates
 from utils.clock import today_for_user
 from utils.date_utils import (
     format_date_full_ru,
+    is_skip_time_phrase,
     parse_natural_date,
+    parse_time,
     weekday_name,
 )
 from utils.reminder_utils import describe_reminder, parse_reminder_offset
 from utils.repeat_parser import describe_rule
-from utils.text import MAX_DESCRIPTION, MAX_MESSAGE, MAX_TITLE, esc
+from utils.text import (
+    MAX_DESCRIPTION,
+    MAX_MESSAGE,
+    MAX_TITLE,
+    esc,
+    unquote_menu_literal,
+)
 
 router = Router(name="myplans")
 
@@ -130,7 +150,12 @@ def build_all_days_view(
             f"— задач: {len(items)}"
         )
         for item in items[:6]:
-            prefix = "🔁" if item.kind == "recur" else "•"
+            if item.done_at:
+                prefix = "✅"
+            elif item.kind == "recur":
+                prefix = "🔁"
+            else:
+                prefix = "•"
             lines.append(
                 f"   {prefix} {esc(item.time_label())} — {esc(item.title, 60)}"
             )
@@ -188,11 +213,15 @@ def build_rules_view(
         t_lbl = r["time_start"] or "без времени"
         if r["time_start"] and r["time_end"]:
             t_lbl = f"{r['time_start']}-{r['time_end']}"
+        mark = "⏸" if not r["active"] else "🔁"
         lines.append(
-            f"• {esc(t_lbl)} — <b>{esc(r['title'], 60)}</b> "
+            f"{mark} {esc(t_lbl)} — <b>{esc(r['title'], 60)}</b> "
             f"({esc(describe_rule(r['rule_type'], r['rule_value']))})"
         )
-    lines.append("\nНажми на задачу ниже, чтобы удалить все её повторения.")
+    lines.append(
+        "\nНажми на повтор, чтобы поставить на паузу/включить, "
+        "или 🗑, чтобы удалить все его повторения."
+    )
     return "\n".join(lines), rules_delete_keyboard(rules, page, page_size)
 
 
@@ -226,6 +255,33 @@ async def cmd_myplans(message: Message, state: FSMContext, db: UserDB) -> None:
     await state.clear()
     today = today_for_user(db)
     await message.answer(WEEK_INTRO, reply_markup=week_days_keyboard(today, db=db))
+
+
+def _stats_view(db: UserDB) -> tuple[str, InlineKeyboardMarkup]:
+    today = today_for_user(db)
+    since = today - timedelta(days=6)
+    text = (
+        "📊 <b>Статистика за 7 дней</b>\n\n"
+        f"✅ Разовых выполнено: <b>{count_done_plans(db, since)}</b>\n"
+        f"🔁 Повторяющихся выполнено: <b>{count_done_rules(db, since)}</b>\n\n"
+        f"📌 Активных разовых задач: <b>{count_active_plans(db, today)}</b>\n"
+        f"🔁 Активных повторов: <b>{count_active_rules(db)}</b>"
+    )
+    return text, stats_keyboard()
+
+
+@router.message(Command("stats", ignore_case=True))
+async def cmd_stats(message: Message, state: FSMContext, db: UserDB) -> None:
+    await state.clear()
+    text, kb = _stats_view(db)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "stats")
+async def cb_stats(callback: CallbackQuery, db: UserDB) -> None:
+    text, kb = _stats_view(db)
+    await callback.answer()
+    await _safe_edit(callback.message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "week_menu")
@@ -328,11 +384,47 @@ def _item_detail_text(target: PlanItem, reminder: str) -> str:
         recur_line = (
             f"\n🔁 Повторение: {html.escape(describe_rule(target.rule_type, target.rule_value))}"
         )
+    status_line = "\n✅ <b>Выполнено</b>" if target.done_at else ""
     return (
         f"<b>{esc(target.title, MAX_TITLE)}</b>\n"
-        f"🕐 {html.escape(target.time_label())}{recur_line}\n\n"
+        f"🕐 {html.escape(target.time_label())}{recur_line}{status_line}\n\n"
         f"💬 Описание: {description}\n\n"
         f"{reminder}"
+    )
+
+
+@router.callback_query(F.data.startswith("toggle_done:"))
+async def on_toggle_done(callback: CallbackQuery, db: UserDB) -> None:
+    _, kind, source_id_str, iso_date = (callback.data or "").split(":", 3)
+    source_id = int(source_id_str)
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    items = get_plans_for_date(db, d)
+    _, target = _find_item(items, kind, source_id_str)
+    if target is None:
+        await callback.answer("Задача не найдена", show_alert=True)
+        return
+
+    make_done = not bool(target.done_at)
+    if kind == "plan":
+        toggle_plan_done(db, source_id, make_done)
+    else:
+        toggle_rule_done(db, source_id, d, make_done)
+
+    await callback.answer("✅ Готово" if make_done else "↩️ Возвращено")
+    items = get_plans_for_date(db, d)
+    _, target = _find_item(items, kind, source_id_str)
+    if target is None:
+        await _safe_edit(
+            callback.message,
+            build_day_text(d, items),
+            day_plans_keyboard(d, items),
+        )
+        return
+
+    await _safe_edit(
+        callback.message,
+        _item_detail_text(target, describe_reminder(target.reminder_minutes)),
+        item_detail_keyboard(d, target),
     )
 
 
@@ -365,6 +457,132 @@ async def on_view_item(callback: CallbackQuery, db: UserDB) -> None:
     await callback.answer()
     await _safe_edit(
         callback.message, text, reply_markup=item_detail_keyboard(d, target)
+    )
+
+
+# ─── Редактирование задач ─────────────────────────────────────────────────────
+
+
+_EDIT_PROMPTS = {
+    "title": "📝 Пришли новое название задачи.",
+    "description": "💬 Пришли новое описание (или «-», чтобы убрать).",
+    "date": "📅 Пришли новую дату задачи.",
+    "start_date": "📅 С какой даты повторять задачу?",
+    "time_start": "🕐 Пришли новое время начала (или «без времени»).",
+    "time_end": "🏁 Пришли новое время окончания (или «без окончания»).",
+}
+
+
+@router.callback_query(F.data.startswith("edit_menu:"))
+async def on_edit_menu(callback: CallbackQuery, db: UserDB) -> None:
+    _, kind, source_id_str, iso_date = (callback.data or "").split(":", 3)
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    items = get_plans_for_date(db, d)
+    _, target = _find_item(items, kind, source_id_str)
+    if target is None:
+        await callback.answer("Задача не найдена", show_alert=True)
+        return
+    await callback.answer()
+    await _safe_edit(
+        callback.message,
+        f"✏️ Редактирование: <b>{esc(target.title, MAX_TITLE)}</b>\n\nЧто меняем?",
+        edit_item_keyboard(d, target),
+    )
+
+
+@router.callback_query(F.data.startswith("edit_field:"))
+async def on_edit_field(
+    callback: CallbackQuery, state: FSMContext, db: UserDB
+) -> None:
+    _, kind, source_id_str, iso_date, field = (callback.data or "").split(":", 4)
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    items = get_plans_for_date(db, d)
+    _, target = _find_item(items, kind, source_id_str)
+    if target is None:
+        await callback.answer("Задача не найдена", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(PlanEditStates.waiting_value)
+    await state.update_data(
+        kind=kind, source_id=int(source_id_str), iso_date=iso_date, field=field
+    )
+    if callback.message:
+        await callback.message.answer(
+            _EDIT_PROMPTS.get(field, "Пришли новое значение."),
+            reply_markup=cancel_inline_keyboard(),
+        )
+
+
+@router.message(
+    StateFilter(PlanEditStates.waiting_value),
+    ~F.text.startswith("/"),
+    ~F.text.in_(MAIN_MENU_BUTTONS),
+)
+async def process_edit_value(
+    message: Message, state: FSMContext, db: UserDB
+) -> None:
+    data = await state.get_data()
+    kind = data["kind"]
+    source_id = int(data["source_id"])
+    field = data["field"]
+    old_date = datetime.strptime(data["iso_date"], "%Y-%m-%d").date()
+    raw = (message.text or "").strip()
+
+    value = None
+    new_date = None
+
+    if field == "title":
+        value = unquote_menu_literal(raw, MAIN_MENU_BUTTONS)
+        if not value:
+            await message.answer("Название не может быть пустым.")
+            return
+        if len(value) > MAX_TITLE:
+            await message.answer(f"Максимум {MAX_TITLE} символов.")
+            return
+    elif field == "description":
+        value = None if raw.lower() in {"-", "нет", "без описания"} or not raw else raw
+        if value is not None and len(value) > MAX_DESCRIPTION:
+            await message.answer(f"Максимум {MAX_DESCRIPTION} символов.")
+            return
+    elif field in {"date", "start_date"}:
+        parsed = parse_natural_date(raw, today=today_for_user(db))
+        if parsed is None:
+            await message.answer("Не понял дату. Напиши, например, <code>19.10</code>.")
+            return
+        new_date = parsed
+        value = parsed.isoformat()
+    elif field in {"time_start", "time_end"}:
+        if is_skip_time_phrase(raw):
+            value = None
+        else:
+            value = parse_time(raw)
+            if value is None:
+                await message.answer("Не понял время. Напиши, например, <code>14:30</code>.")
+                return
+
+    if kind == "plan":
+        kwargs = {field: value}
+        if field == "date":
+            kwargs = {"plan_date": new_date}
+        update_plan(db, source_id, **kwargs)
+    else:
+        kwargs = {field: value}
+        if field == "start_date":
+            kwargs = {"start_date": new_date}
+        update_rule(db, source_id, **kwargs)
+
+    await state.clear()
+
+    show_date = new_date or old_date
+    items = get_plans_for_date(db, show_date)
+    _, target = _find_item(items, kind, str(source_id))
+    if target is None:
+        await message.answer("Готово ✅")
+        return
+
+    await message.answer(
+        _item_detail_text(target, describe_reminder(target.reminder_minutes)),
+        reply_markup=item_detail_keyboard(show_date, target),
     )
 
 
@@ -515,6 +733,19 @@ async def cb_delete_rules(callback: CallbackQuery, db: UserDB) -> None:
     page = int(page_str) if page_str.isdigit() else 0
     text, kb = build_rules_view(db, page=page)
     await callback.answer()
+    await _safe_edit(callback.message, text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("rule_toggle:"))
+async def cb_rule_toggle(callback: CallbackQuery, db: UserDB) -> None:
+    _, rule_id_str, page_str = (callback.data or "").split(":", 2)
+    active = toggle_rule_active(db, int(rule_id_str))
+    if active is None:
+        await callback.answer("Повтор уже удалён", show_alert=True)
+        return
+    await callback.answer("▶️ Включено" if active else "⏸ Пауза")
+    page = int(page_str) if page_str.isdigit() else 0
+    text, kb = build_rules_view(db, page=page)
     await _safe_edit(callback.message, text, reply_markup=kb)
 
 

@@ -187,6 +187,13 @@ def get_plans_for_date(
 
     # Если правила уже загружены вызывающим кодом — не читаем их из БД повторно
     rule_rows = rules if rules is not None else get_all_recurring_rules(db)
+    done_rules = {
+        int(row["rule_id"]): row["done_at"]
+        for row in db.conn.execute(
+            "SELECT rule_id, done_at FROM rule_completions WHERE occurrence_date = ?",
+            (d.isoformat(),),
+        ).fetchall()
+    }
     for rule in rule_rows:
         if _rule_occurs_on(rule, d):
             items.append(
@@ -200,6 +207,7 @@ def get_plans_for_date(
                     reminder_minutes=rule["reminder_minutes"],
                     rule_type=rule["rule_type"],
                     rule_value=rule["rule_value"],
+                    done_at=done_rules.get(int(rule["id"])),
                 )
             )
 
@@ -227,6 +235,7 @@ def delete_plan(db: UserDB, plan_id: int) -> None:
 
 
 def delete_rule(db: UserDB, rule_id: int) -> None:
+    db.conn.execute("DELETE FROM rule_completions WHERE rule_id = ?", (rule_id,))
     db.conn.execute("DELETE FROM recurring_rules WHERE id = ?", (rule_id,))
     db.conn.commit()
 
@@ -255,6 +264,9 @@ def delete_all_for_date(db: UserDB, d: date) -> int:
     if not items:
         return 0
     db.conn.execute("DELETE FROM plans WHERE plan_date = ?", (d.isoformat(),))
+    db.conn.execute(
+        "DELETE FROM rule_completions WHERE occurrence_date = ?", (d.isoformat(),)
+    )
     for item in items:
         if item.kind == "recur":
             exclude_rule_date(db, item.source_id, d)
@@ -340,3 +352,225 @@ def get_plan_counts_for_dates(db: UserDB, dates: list[date]) -> dict[date, int]:
             counts[d] += sum(1 for rule in rules if _rule_occurs_on(rule, d))
 
     return counts
+
+
+def toggle_plan_done(db: UserDB, plan_id: int, done: bool) -> None:
+    if done:
+        db.conn.execute(
+            "UPDATE plans SET done_at = datetime('now','localtime') WHERE id = ?",
+            (plan_id,),
+        )
+    else:
+        db.conn.execute(
+            "UPDATE plans SET done_at = NULL WHERE id = ?", (plan_id,)
+        )
+    db.conn.commit()
+
+
+def is_rule_done(db: UserDB, rule_id: int, d: date) -> bool:
+    row = db.conn.execute(
+        "SELECT 1 FROM rule_completions WHERE rule_id = ? AND occurrence_date = ?",
+        (rule_id, d.isoformat()),
+    ).fetchone()
+    return row is not None
+
+
+def toggle_rule_done(db: UserDB, rule_id: int, d: date, done: bool) -> None:
+    if done:
+        db.conn.execute(
+            """
+            INSERT OR REPLACE INTO rule_completions
+                (rule_id, occurrence_date, done_at)
+            VALUES (?, ?, datetime('now','localtime'))
+            """,
+            (rule_id, d.isoformat()),
+        )
+    else:
+        db.conn.execute(
+            "DELETE FROM rule_completions WHERE rule_id = ? AND occurrence_date = ?",
+            (rule_id, d.isoformat()),
+        )
+    db.conn.commit()
+
+
+def toggle_rule_active(db: UserDB, rule_id: int) -> Optional[bool]:
+    row = db.conn.execute(
+        "SELECT active FROM recurring_rules WHERE id = ?", (rule_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    new_active = 0 if row["active"] else 1
+    db.conn.execute(
+        "UPDATE recurring_rules SET active = ? WHERE id = ?", (new_active, rule_id)
+    )
+    db.conn.commit()
+    return bool(new_active)
+
+
+def search_plans(db: UserDB, query: str, limit: int = 10) -> list[sqlite3.Row]:
+    like = f"%{query.strip()}%"
+    return db.conn.execute(
+        """
+        SELECT * FROM plans
+        WHERE title LIKE ? OR description LIKE ?
+        ORDER BY plan_date DESC, id DESC
+        LIMIT ?
+        """,
+        (like, like, limit),
+    ).fetchall()
+
+
+def search_rules(db: UserDB, query: str, limit: int = 10) -> list[sqlite3.Row]:
+    like = f"%{query.strip()}%"
+    return db.conn.execute(
+        """
+        SELECT * FROM recurring_rules
+        WHERE title LIKE ? OR description LIKE ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (like, like, limit),
+    ).fetchall()
+
+
+def count_done_plans(db: UserDB, since: date) -> int:
+    row = db.conn.execute(
+        "SELECT COUNT(*) AS cnt FROM plans WHERE done_at IS NOT NULL AND done_at >= ?",
+        (since.isoformat(),),
+    ).fetchone()
+    return int(row["cnt"])
+
+
+def count_done_rules(db: UserDB, since: date) -> int:
+    row = db.conn.execute(
+        "SELECT COUNT(*) AS cnt FROM rule_completions WHERE done_at >= ?",
+        (since.isoformat(),),
+    ).fetchone()
+    return int(row["cnt"])
+
+
+def count_active_plans(db: UserDB, today: date) -> int:
+    row = db.conn.execute(
+        "SELECT COUNT(*) AS cnt FROM plans WHERE done_at IS NULL AND plan_date >= ?",
+        (today.isoformat(),),
+    ).fetchone()
+    return int(row["cnt"])
+
+
+def count_active_rules(db: UserDB) -> int:
+    row = db.conn.execute(
+        "SELECT COUNT(*) AS cnt FROM recurring_rules WHERE active = 1"
+    ).fetchone()
+    return int(row["cnt"])
+
+
+def add_snooze(
+    db: UserDB,
+    kind: str,
+    source_id: int,
+    occurrence_date: Optional[str],
+    title: str,
+    start_time: Optional[str],
+    remind_at: str,
+) -> int:
+    cur = db.conn.execute(
+        """
+        INSERT INTO snoozes
+            (kind, source_id, occurrence_date, title, start_time, remind_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+        """,
+        (kind, source_id, occurrence_date, title, start_time, remind_at),
+    )
+    db.conn.commit()
+    return int(cur.lastrowid)
+
+
+def due_snoozes(db: UserDB, now_iso: str) -> list[sqlite3.Row]:
+    return db.conn.execute(
+        "SELECT * FROM snoozes WHERE remind_at <= ? ORDER BY remind_at, id",
+        (now_iso,),
+    ).fetchall()
+
+
+def delete_snooze(db: UserDB, snooze_id: int) -> None:
+    db.conn.execute("DELETE FROM snoozes WHERE id = ?", (snooze_id,))
+    db.conn.commit()
+
+
+_UNSET = object()
+
+
+def update_plan(
+    db: UserDB,
+    plan_id: int,
+    title: object = _UNSET,
+    description: object = _UNSET,
+    plan_date: object = _UNSET,
+    time_start: object = _UNSET,
+    time_end: object = _UNSET,
+) -> None:
+    sets: list[str] = []
+    params: list[object] = []
+    reset_reminder = False
+    if title is not _UNSET:
+        sets.append("title = ?")
+        params.append(title)
+    if description is not _UNSET:
+        sets.append("description = ?")
+        params.append(description)
+    if plan_date is not _UNSET:
+        sets.append("plan_date = ?")
+        params.append(
+            plan_date.isoformat() if isinstance(plan_date, date) else plan_date
+        )
+        reset_reminder = True
+    if time_start is not _UNSET:
+        sets.append("time_start = ?")
+        params.append(time_start)
+        reset_reminder = True
+    if time_end is not _UNSET:
+        sets.append("time_end = ?")
+        params.append(time_end)
+    if reset_reminder:
+        sets.append("reminder_sent = 0")
+    params.append(plan_id)
+    if sets:
+        db.conn.execute(f"UPDATE plans SET {', '.join(sets)} WHERE id = ?", params)
+        db.conn.commit()
+
+
+def update_rule(
+    db: UserDB,
+    rule_id: int,
+    title: object = _UNSET,
+    description: object = _UNSET,
+    start_date: object = _UNSET,
+    time_start: object = _UNSET,
+    time_end: object = _UNSET,
+) -> None:
+    sets: list[str] = []
+    params: list[object] = []
+    if title is not _UNSET:
+        sets.append("title = ?")
+        params.append(title)
+    if description is not _UNSET:
+        sets.append("description = ?")
+        params.append(description)
+    if start_date is not _UNSET:
+        sets.append("start_date = ?")
+        params.append(
+            start_date.isoformat() if isinstance(start_date, date) else start_date
+        )
+    if time_start is not _UNSET:
+        sets.append("time_start = ?")
+        params.append(time_start)
+        sets.append("last_reminder_date = NULL")
+    if time_end is not _UNSET:
+        sets.append("time_end = ?")
+        params.append(time_end)
+    params.append(rule_id)
+    if sets:
+        db.conn.execute(
+            f"UPDATE recurring_rules SET {', '.join(sets)} WHERE id = ?", params
+        )
+        db.conn.commit()

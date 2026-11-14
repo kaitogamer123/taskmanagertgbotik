@@ -26,15 +26,20 @@ from aiogram.types import BotCommand, ErrorEvent
 from config import BASE_DIR, BOT_TOKEN, BOT_VERSION, OWNER_IDS
 from database.db_manager import ensure_index
 from handlers import (
+    broadcast,
     database_cmd,
     everyn,
+    feedback,
     myplans,
     newplan,
+    notes,
     settings,
+    snooze,
     start,
     system_cmd,
     timezone_cmd,
 )
+from middlewares.antispam import AntispamMiddleware
 from middlewares.db_middleware import UserDBMiddleware
 from middlewares.timezone_middleware import TimezoneGateMiddleware
 from services.auto_pull import run_auto_pull
@@ -117,6 +122,10 @@ async def set_bot_commands(bot: Bot) -> None:
                 BotCommand(command="alldays", description="В какие дни есть задачи"),
                 BotCommand(command="newplan", description="Добавить новую задачу"),
                 BotCommand(command="everyn", description="Добавить повторяющуюся задачу"),
+                BotCommand(command="notes", description="Заметки и папки"),
+                BotCommand(command="find", description="Поиск по задачам и заметкам"),
+                BotCommand(command="stats", description="Статистика выполнения"),
+                BotCommand(command="feedback", description="Написать владельцу бота"),
                 BotCommand(command="delete", description="Удалить задачу"),
                 BotCommand(command="changetime", description="Изменить свой часовой пояс"),
                 BotCommand(command="notify", description="Настройка времени и уведомлений"),
@@ -171,6 +180,10 @@ async def main() -> None:
         return True
 
     # 1. Открываем персональную SQLite БД пользователя
+    antispam = AntispamMiddleware()
+    dp.message.middleware(antispam)
+    dp.callback_query.middleware(antispam)
+
     db_middleware = UserDBMiddleware()
     dp.message.middleware(db_middleware)
     dp.callback_query.middleware(db_middleware)
@@ -182,12 +195,16 @@ async def main() -> None:
 
     # 3. Регистрация роутеров (универсальный разбор дат в myplans идёт последним)
     dp.include_router(system_cmd.router)
+    dp.include_router(broadcast.router)
+    dp.include_router(feedback.router)
     dp.include_router(timezone_cmd.router)
     dp.include_router(start.router)
     dp.include_router(database_cmd.router)
     dp.include_router(settings.router)
     dp.include_router(newplan.router)
     dp.include_router(everyn.router)
+    dp.include_router(notes.router)
+    dp.include_router(snooze.router)
     dp.include_router(myplans.router)
 
     await set_bot_commands(bot)

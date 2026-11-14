@@ -32,7 +32,14 @@ from aiogram.exceptions import (
 
 from config import NOTIFIER_POLL_INTERVAL
 from database.db_manager import UserDB, iter_all_user_ids, open_user_db_by_id
-from database.plans_repo import PlanItem, _rule_occurs_on, get_plans_for_date
+from database.plans_repo import (
+    PlanItem,
+    _rule_occurs_on,
+    delete_snooze,
+    due_snoozes,
+    get_plans_for_date,
+    is_rule_done,
+)
 from database.settings_repo import (
     NotifySettings,
     get_settings,
@@ -44,6 +51,7 @@ from utils.clock import now_for_offset
 from utils.date_utils import format_date_full_ru, weekday_name
 from utils.reminder_utils import format_minutes_label
 from utils.text import MAX_TITLE, esc, paginate_lines
+from keyboards.inline import snooze_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -59,19 +67,24 @@ class UserBlocked(Exception):
 def _digest_lines(items: list[PlanItem]) -> list[str]:
     if not items:
         return ["На этот день пока ничего не запланировано 🙂"]
+    undone = [item for item in items if not item.done_at]
+    if not undone:
+        return ["На этот день всё выполнено ✅"]
     return [
         f"🕐 {esc(item.time_label())} — {esc(item.title, MAX_TITLE)}"
-        for item in items
+        for item in undone
     ]
 
 
-async def _send_with_retry(bot: Bot, chat_id: int, text: str) -> None:
+async def _send_with_retry(
+    bot: Bot, chat_id: int, text: str, reply_markup=None
+) -> None:
     try:
-        await bot.send_message(chat_id, text)
+        await bot.send_message(chat_id, text, reply_markup=reply_markup)
     except TelegramRetryAfter as exc:
         # Flood control: ждём столько, сколько просит Telegram (но не бесконечно)
         await asyncio.sleep(min(exc.retry_after, 30) + 1)
-        await bot.send_message(chat_id, text)
+        await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
 async def _send_chunks(
@@ -221,6 +234,7 @@ async def _check_plan_reminders(
           AND reminder_minutes IS NOT NULL
           AND reminder_minutes > 0
           AND time_start IS NOT NULL
+          AND done_at IS NULL
         """
     ).fetchall()
 
@@ -249,7 +263,12 @@ async def _check_plan_reminders(
         if target_dt <= now <= target_dt + GRACE_WINDOW:
             text = _reminder_text(row["title"], now, start_dt)
             try:
-                await _send_with_retry(bot, telegram_id, text)
+                await _send_with_retry(
+                    bot,
+                    telegram_id,
+                    text,
+                    reply_markup=snooze_keyboard("plan", int(row["id"])),
+                )
             except (TelegramForbiddenError, TelegramNotFound):
                 mark_user_blocked(db.conn)
                 raise UserBlocked
@@ -292,6 +311,8 @@ async def _check_rule_reminders(
                 continue
             if not _rule_occurs_on(row, candidate_date):
                 continue
+            if is_rule_done(db, int(row["id"]), candidate_date):
+                continue
 
             start_dt = datetime.combine(
                 candidate_date, datetime.min.time()
@@ -302,7 +323,14 @@ async def _check_rule_reminders(
             if target_dt <= now <= target_dt + GRACE_WINDOW:
                 text = _reminder_text(row["title"], now, start_dt)
                 try:
-                    await _send_with_retry(bot, telegram_id, text)
+                    await _send_with_retry(
+                        bot,
+                        telegram_id,
+                        text,
+                        reply_markup=snooze_keyboard(
+                            "recur", int(row["id"]), candidate_date.isoformat()
+                        ),
+                    )
                 except (TelegramForbiddenError, TelegramNotFound):
                     mark_user_blocked(db.conn)
                     raise UserBlocked
@@ -315,6 +343,44 @@ async def _check_rule_reminders(
 
     if changed:
         db.conn.commit()
+
+
+async def _check_snoozes(
+    bot: Bot,
+    telegram_id: int,
+    db: UserDB,
+    now: datetime,
+    settings: NotifySettings,
+) -> None:
+    rows = due_snoozes(db, now.strftime("%Y-%m-%d %H:%M"))
+    for row in rows:
+        try:
+            target = datetime.strptime(row["remind_at"], "%Y-%m-%d %H:%M")
+        except ValueError:
+            delete_snooze(db, int(row["id"]))
+            continue
+
+        target = _adjust_for_quiet(target, settings)
+        if now > target + GRACE_WINDOW:
+            delete_snooze(db, int(row["id"]))
+            continue
+        if target <= now <= target + GRACE_WINDOW:
+            text = f'⏰ Напоминание: «<b>{esc(row["title"], MAX_TITLE)}</b>»'
+            try:
+                await _send_with_retry(
+                    bot,
+                    telegram_id,
+                    text,
+                    reply_markup=snooze_keyboard(
+                        row["kind"],
+                        int(row["source_id"]),
+                        row["occurrence_date"],
+                    ),
+                )
+            except (TelegramForbiddenError, TelegramNotFound):
+                mark_user_blocked(db.conn)
+                raise UserBlocked
+            delete_snooze(db, int(row["id"]))
 
 
 async def _process_user(bot: Bot, telegram_id: int) -> None:
@@ -333,6 +399,7 @@ async def _process_user(bot: Bot, telegram_id: int) -> None:
         await _check_daily_digests(bot, telegram_id, db, user_now, settings)
         await _check_plan_reminders(bot, telegram_id, db, user_now, settings)
         await _check_rule_reminders(bot, telegram_id, db, user_now, settings)
+        await _check_snoozes(bot, telegram_id, db, user_now, settings)
     except UserBlocked:
         logger.info("Пользователь %s заблокировал бота — пропускаем", telegram_id)
     except Exception:  # noqa: BLE001 - один сбой не должен останавливать весь цикл

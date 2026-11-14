@@ -48,7 +48,7 @@ class TimezoneGateMiddleware(BaseMiddleware):
         # Разрешаем системные команды владельцу даже до настройки пояса
         if isinstance(event, Message) and event.text and user.id in OWNER_IDS:
             command = event.text.strip().lower().split("@", 1)[0]
-            if command in {"/update", "/status", "/restart", "/backup"}:
+            if command in {"/update", "/status", "/restart", "/backup", "/broadcast"}:
                 return await handler(event, data)
 
         current_state = await state.get_state()
