@@ -120,8 +120,9 @@ async def set_bot_commands(bot: Bot) -> None:
             [
                 BotCommand(command="start", description="Начало работы с ботом"),
                 BotCommand(command="help", description="Справка и примеры"),
-                BotCommand(command="myplans", description="Планы на ближайшую неделю"),
-                BotCommand(command="alldays", description="В какие дни есть задачи"),
+                BotCommand(command="myplans", description="Активные планы"),
+                BotCommand(command="history", description="История планов"),
+                BotCommand(command="alldays", description="Активные дни с задачами"),
                 BotCommand(command="calendar", description="Календарь на месяц"),
                 BotCommand(command="export", description="Экспорт планов в .ics"),
                 BotCommand(command="newplan", description="Добавить новую задачу"),

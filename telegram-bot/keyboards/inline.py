@@ -76,9 +76,8 @@ def week_days_keyboard(
         )
 
     builder.row(
-        InlineKeyboardButton(
-            text="📋 В какие дни есть задачи", callback_data="all_days:0"
-        )
+        InlineKeyboardButton(text="📋 Активные дни", callback_data="all_days:0"),
+        InlineKeyboardButton(text="🕓 История", callback_data="hist:0"),
     )
     builder.row(
         InlineKeyboardButton(
@@ -133,7 +132,10 @@ def all_days_keyboard(
 
     builder.row(
         InlineKeyboardButton(text="🗑 Удалить задачу", callback_data="del_menu"),
-        InlineKeyboardButton(text="⬅️ К неделе", callback_data="week_menu"),
+        InlineKeyboardButton(text="🕓 История", callback_data="hist:0"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ К неделе", callback_data="week_menu")
     )
     return builder.as_markup()
 

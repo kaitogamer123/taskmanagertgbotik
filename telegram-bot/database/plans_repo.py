@@ -484,6 +484,28 @@ def get_scheduled_days(
     return result, rules
 
 
+def get_history_dates(db: UserDB, today: date) -> list[date]:
+    """Даты для истории: прошедшие дни и дни с выполненными задачами."""
+    dates: set[date] = set()
+    for row in db.conn.execute(
+        "SELECT DISTINCT plan_date FROM plans "
+        "WHERE plan_date < ? OR done_at IS NOT NULL",
+        (today.isoformat(),),
+    ).fetchall():
+        try:
+            dates.add(date.fromisoformat(row["plan_date"]))
+        except ValueError:
+            continue
+    for row in db.conn.execute(
+        "SELECT DISTINCT occurrence_date FROM rule_completions"
+    ).fetchall():
+        try:
+            dates.add(date.fromisoformat(row["occurrence_date"]))
+        except ValueError:
+            continue
+    return sorted(dates, reverse=True)
+
+
 def get_plan_counts_for_dates(db: UserDB, dates: list[date]) -> dict[date, int]:
     """
     Возвращает количество задач для каждой даты из `dates` за 2 SQL-запроса

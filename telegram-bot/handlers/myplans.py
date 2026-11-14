@@ -36,6 +36,7 @@ from database.plans_repo import (
     get_plans_for_date,
     get_rule_row,
     get_scheduled_days,
+    get_history_dates,
     get_plan_counts_for_dates,
     add_reminder,
     delete_reminder,
@@ -66,9 +67,11 @@ from keyboards.inline import (
     week_days_keyboard,
 )
 from keyboards.reply import (
+    BTN_ACTIVE_PLANS,
     BTN_ALL_DAYS,
     BTN_DELETE_TASK,
-    BTN_MY_PLANS,
+    BTN_HISTORY,
+    BTN_OLD_PLANS,
     MAIN_MENU_BUTTONS,
 )
 from states import PlanEditStates, ReminderEditStates
@@ -86,6 +89,7 @@ from utils.text import (
     MAX_DESCRIPTION,
     MAX_MESSAGE,
     MAX_TITLE,
+    clip_button,
     esc,
     unquote_menu_literal,
 )
@@ -108,7 +112,8 @@ MONTH_NAMES = [
 ]
 
 WEEK_INTRO = (
-    "Привет, вот твои планы на ближайшую неделю :)\n"
+    "📅 <b>Активные планы</b>\n"
+    "Вот твои планы на ближайшую неделю :)\n"
     "<i>(Также можешь просто написать любую дату сообщением — и я сразу открою этот день)</i>"
 )
 
@@ -151,19 +156,22 @@ def _day_badge(d: date, today: date) -> str:
 def build_all_days_view(
     db: UserDB, page: int = 0, page_size: int = 5
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    """Формирует текст и клавиатуру для кнопки «В какие дни есть задачи»."""
+    """Формирует текст и клавиатуру для кнопки «Активные дни»."""
     today = today_for_user(db)
     days_list, rules = get_scheduled_days(db, today)
+    days_list = [(d, items) for d, items in days_list if d >= today]
+    rules = [r for r in rules if r["active"]]
 
     if not days_list and not rules:
         return (
-            "📭 <b>Сейчас у тебя нет ни одной запланированной задачи.</b>\n\n"
-            "Добавить новую задачу можно кнопкой <b>«➕ Новая задача»</b> "
-            "(или командой /NewPlan), а повторяющуюся — <b>«🔁 Повторяющаяся»</b> (/everyN).",
+            "📭 <b>Активных задач нет.</b>\n\n"
+            "Прошедшие планы смотри в <b>«🕓 История планов»</b>.\n"
+            "Добавить задачу — <b>«➕ Новая задача»</b> (/NewPlan), "
+            "повторяющуюся — <b>«🔁 Повторяющаяся»</b> (/everyN).",
             None,
         )
 
-    lines: list[str] = ["📋 <b>Дни, в которые у тебя есть задачи:</b>\n"]
+    lines: list[str] = ["📋 <b>Активные дни с задачами:</b>\n"]
 
     total_days = len(days_list)
     max_pages = max(1, (total_days + page_size - 1) // page_size)
@@ -219,6 +227,71 @@ def build_all_days_view(
 
     kb = all_days_keyboard(days_list, today=today, page=page, page_size=page_size)
     return text, kb
+
+
+def build_history_view(
+    db: UserDB, page: int = 0, page_size: int = 5
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    today = today_for_user(db)
+    dates = get_history_dates(db, today)
+    if not dates:
+        return "🕓 <b>История планов</b>\n\nПока пусто.", None
+
+    max_pages = max(1, (len(dates) + page_size - 1) // page_size)
+    page = max(0, min(page, max_pages - 1))
+    slice_dates = dates[page * page_size : (page + 1) * page_size]
+
+    lines: list[str] = [
+        f"🕓 <b>История планов</b> (страница {page + 1} из {max_pages}):\n"
+    ]
+    rows: list[tuple[date, list[PlanItem]]] = []
+    for d in slice_dates:
+        items = get_plans_for_date(db, d)
+        rows.append((d, items))
+        lines.append(
+            f"📅 <b>{format_date_full_ru(d)}, {weekday_name(d)}</b> — задач: {len(items)}"
+        )
+        for item in items[:5]:
+            if item.done_at:
+                prefix = "✅"
+            elif item.kind == "recur":
+                prefix = "🔁"
+            else:
+                prefix = "•"
+            lines.append(
+                f"   {prefix} {esc(item.time_label())} — {esc(item.title, 60)}"
+            )
+        if len(items) > 5:
+            lines.append(f"   … и ещё {len(items) - 5}")
+        lines.append("")
+
+    lines.append("👇 Нажми на день ниже, чтобы открыть его:")
+
+    builder = InlineKeyboardBuilder()
+    for d, items in rows:
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(
+                    f"🕓 {format_date_full_ru(d)} — задач: {len(items)}"
+                ),
+                callback_data=f"day:{d.isoformat()}",
+            )
+        )
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(text="⬅️", callback_data=f"hist:{page - 1}")
+        )
+    if page + 1 < max_pages:
+        nav.append(
+            InlineKeyboardButton(text="➡️", callback_data=f"hist:{page + 1}")
+        )
+    if nav:
+        builder.row(*nav)
+    builder.row(
+        InlineKeyboardButton(text="⬅️ К активным", callback_data="week_menu")
+    )
+    return "\n".join(lines), builder.as_markup()
 
 
 def build_rules_view(
@@ -419,7 +492,8 @@ def build_delete_menu_view(
 
 
 @router.message(Command("MyPlans", "myplans", ignore_case=True))
-@router.message(F.text == BTN_MY_PLANS)
+@router.message(F.text == BTN_ACTIVE_PLANS)
+@router.message(F.text == BTN_OLD_PLANS)
 async def cmd_myplans(message: Message, state: FSMContext, db: UserDB) -> None:
     await state.clear()
     today = today_for_user(db)
@@ -490,6 +564,23 @@ async def cb_export_ics(callback: CallbackQuery, db: UserDB) -> None:
     await callback.answer()
     if callback.message:
         await _send_ics(callback.message, db)
+
+
+@router.message(Command("history", ignore_case=True))
+@router.message(F.text == BTN_HISTORY)
+async def cmd_history(message: Message, state: FSMContext, db: UserDB) -> None:
+    await state.clear()
+    text, kb = build_history_view(db, 0)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("hist:"))
+async def cb_history(callback: CallbackQuery, db: UserDB) -> None:
+    _, page_str = (callback.data or "").split(":", 1)
+    page = int(page_str) if page_str.isdigit() else 0
+    text, kb = build_history_view(db, page)
+    await callback.answer()
+    await _safe_edit(callback.message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "week_menu")

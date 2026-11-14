@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 import database.db_manager as dm
 import services.notifier as notifier
+import handlers.myplans as myplans
 from database.plans_repo import (
     add_plan,
     add_reminder,
     delete_reminder,
+    get_history_dates,
     get_plans_for_date,
     get_reminders,
     set_reminders,
@@ -97,6 +99,24 @@ async def test_multiple_reminders_notifier(
     # повторный тик не дублирует
     await notifier._process_user(bot, 2)
     assert sum("Мульти" in text for text in [m[1] for m in bot.messages]) == 2
+
+
+def test_active_vs_history(temp_env: Path) -> None:
+    db = dm.ensure_user_db(5, "hist", "H")
+    today = date.today()
+    add_plan(db, today - timedelta(days=3), "Старый план", "09:00", None, None)
+    add_plan(db, today + timedelta(days=2), "Новый план", "10:00", None, None)
+
+    history = get_history_dates(db, today)
+    assert today - timedelta(days=3) in history
+
+    active_text, _ = myplans.build_all_days_view(db)
+    assert "Новый план" in active_text
+    assert "Старый план" not in active_text
+
+    history_text, _ = myplans.build_history_view(db)
+    assert "Старый план" in history_text
+    db.close()
 
 
 def test_templates(temp_env: Path) -> None:
