@@ -47,7 +47,7 @@ from database.settings_repo import (
     mark_morning_sent,
     mark_user_blocked,
 )
-from utils.clock import now_for_offset
+from utils.clock import now_in_zone
 from utils.date_utils import format_date_full_ru, weekday_name
 from utils.reminder_utils import format_minutes_label
 from utils.text import MAX_TITLE, esc, paginate_lines
@@ -391,10 +391,10 @@ async def _process_user(bot: Bot, telegram_id: int) -> None:
         settings = get_settings(db)
         if settings.blocked:
             return
-        if settings.timezone_configured and settings.utc_offset is not None:
-            user_now = now_for_offset(int(settings.utc_offset))
+        if settings.timezone_configured:
+            user_now = now_in_zone(settings.timezone_name, settings.utc_offset)
         else:
-            user_now = now_for_offset(None)
+            user_now = now_in_zone(None, None)
 
         await _check_daily_digests(bot, telegram_id, db, user_now, settings)
         await _check_plan_reminders(bot, telegram_id, db, user_now, settings)

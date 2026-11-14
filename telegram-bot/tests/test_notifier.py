@@ -72,7 +72,7 @@ def _user(
 
 
 def _set_now(monkeypatch: pytest.MonkeyPatch, value: datetime) -> None:
-    monkeypatch.setattr(notifier, "now_for_offset", lambda offset: value)
+    monkeypatch.setattr(notifier, "now_in_zone", lambda name, offset: value)
 
 
 @pytest.mark.asyncio

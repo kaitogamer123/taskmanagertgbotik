@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
@@ -19,7 +21,7 @@ from database.settings_repo import (
 from keyboards.inline import cancel_inline_keyboard, settings_keyboard
 from keyboards.reply import BTN_TIME_SETTINGS, MAIN_MENU_BUTTONS
 from states import SettingsStates
-from utils.clock import format_utc_offset, now_for_user
+from utils.clock import format_zone_offset, now_for_user
 from utils.date_utils import parse_time
 
 router = Router(name="settings")
@@ -28,14 +30,15 @@ router = Router(name="settings")
 def build_settings_text(db: UserDB) -> str:
     settings = get_settings(db)
     local_str = now_for_user(db).strftime("%H:%M")
-    tz_label = format_utc_offset(settings.utc_offset)
+    tz_label = format_zone_offset(settings.timezone_name, settings.utc_offset)
+    zone_note = f" · {html.escape(settings.timezone_name)}" if settings.timezone_name else ""
     morning = "включены ✅" if settings.morning_enabled else "выключены 🚫"
     evening = "включены ✅" if settings.evening_enabled else "выключены 🚫"
     skip_empty = "не присылать" if settings.skip_empty_digest else "присылать"
     quiet = "включены" if settings.quiet_enabled else "выключены"
     return (
         "⚙️ <b>Настройка времени и уведомлений</b>\n\n"
-        f"🌍 <b>Часовой пояс:</b> {tz_label} (сейчас у тебя <b>{local_str}</b>)\n"
+        f"🌍 <b>Часовой пояс:</b> {tz_label}{zone_note} (сейчас у тебя <b>{local_str}</b>)\n"
         f"🌅 <b>Утренняя сводка</b> (планы на сегодня): {settings.morning_time}, {morning}\n"
         f"🌙 <b>Вечерняя сводка</b> (планы на завтра): {settings.evening_time}, {evening}\n"
         f"🔕 <b>Пустые сводки:</b> {skip_empty}\n"

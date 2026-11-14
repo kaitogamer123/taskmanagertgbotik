@@ -4,14 +4,22 @@
 """
 from __future__ import annotations
 
+import calendar
 import html
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta, timezone
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database.db_manager import UserDB
 from database.plans_repo import (
@@ -28,6 +36,7 @@ from database.plans_repo import (
     get_plans_for_date,
     get_rule_row,
     get_scheduled_days,
+    get_plan_counts_for_dates,
     toggle_plan_done,
     toggle_rule_active,
     toggle_rule_done,
@@ -79,6 +88,21 @@ from utils.text import (
 )
 
 router = Router(name="myplans")
+
+MONTH_NAMES = [
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+]
 
 WEEK_INTRO = (
     "Привет, вот твои планы на ближайшую неделю :)\n"
@@ -225,6 +249,148 @@ def build_rules_view(
     return "\n".join(lines), rules_delete_keyboard(rules, page, page_size)
 
 
+def _ics_escape(value: str) -> str:
+    return (
+        (value or "")
+        .replace("\\", "\\\\")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+        .replace("\n", "\\n")
+    )
+
+
+def _build_ics(db: UserDB) -> bytes:
+    today = today_for_user(db)
+    days, _ = get_scheduled_days(db, today, recurring_horizon_days=30)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//TaskMNGR//RU",
+        "CALSCALE:GREGORIAN",
+    ]
+
+    for d, items in days:
+        if d < today:
+            continue
+        for item in items:
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:taskmngr-{item.kind}-{item.source_id}-{d.isoformat()}@local",
+                f"DTSTAMP:{stamp}",
+            ]
+            if item.time_start:
+                try:
+                    hh, mm = (int(x) for x in item.time_start.split(":"))
+                except (ValueError, AttributeError):
+                    hh, mm = 9, 0
+                start = datetime.combine(d, dtime(hh, mm))
+                end = start + timedelta(hours=1)
+                if item.time_end:
+                    try:
+                        ehh, emm = (int(x) for x in item.time_end.split(":"))
+                        candidate = datetime.combine(d, dtime(ehh, emm))
+                        if candidate > start:
+                            end = candidate
+                    except (ValueError, AttributeError):
+                        pass
+                lines += [
+                    f"DTSTART:{start:%Y%m%dT%H%M%S}",
+                    f"DTEND:{end:%Y%m%dT%H%M%S}",
+                ]
+            else:
+                lines += [
+                    f"DTSTART;VALUE=DATE:{d:%Y%m%d}",
+                    f"DTEND;VALUE=DATE:{(d + timedelta(days=1)):%Y%m%d}",
+                ]
+
+            description = (item.description or "").strip()
+            if item.kind == "recur" and item.rule_type and item.rule_value:
+                description += "\nПовтор: " + describe_rule(
+                    item.rule_type, item.rule_value
+                )
+            if item.done_at:
+                description += "\nВыполнено"
+            lines.append(f"SUMMARY:{_ics_escape(item.title)}")
+            if description.strip():
+                lines.append(f"DESCRIPTION:{_ics_escape(description.strip())}")
+            lines.append("END:VEVENT")
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines).encode("utf-8")
+
+
+async def _send_ics(message: Message, db: UserDB) -> None:
+    await message.answer_document(
+        BufferedInputFile(_build_ics(db), filename="taskmngr.ics"),
+        caption="📤 Календарь для Google/Apple Calendar",
+    )
+
+
+def build_calendar_view(
+    db: UserDB, year: int, month: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    today = today_for_user(db)
+    year = max(1970, min(2100, int(year)))
+    month = int(month)
+    while month < 1:
+        month += 12
+        year -= 1
+    while month > 12:
+        month -= 12
+        year += 1
+
+    days_in_month = calendar.monthrange(year, month)[1]
+    dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
+    counts = get_plan_counts_for_dates(db, dates)
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        *[
+            InlineKeyboardButton(text=name, callback_data="noop")
+            for name in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+        ]
+    )
+    for week in calendar.monthcalendar(year, month):
+        row: list[InlineKeyboardButton] = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+                continue
+            d = date(year, month, day)
+            label = str(day)
+            if counts.get(d, 0) > 0:
+                label += "•"
+            if d == today:
+                label = f"[{label}]"
+            row.append(
+                InlineKeyboardButton(
+                    text=label, callback_data=f"day:{d.isoformat()}"
+                )
+            )
+        builder.row(*row)
+
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️", callback_data=f"cal:{year}:{month - 1}"
+        ),
+        InlineKeyboardButton(
+            text="Сегодня", callback_data=f"cal:{today.year}:{today.month}"
+        ),
+        InlineKeyboardButton(
+            text="➡️", callback_data=f"cal:{year}:{month + 1}"
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ К неделе", callback_data="week_menu")
+    )
+    text = (
+        f"📆 <b>{MONTH_NAMES[month - 1]} {year}</b>\n"
+        "• — есть задачи. Нажми на день, чтобы открыть его."
+    )
+    return text, builder.as_markup()
+
+
 def build_delete_menu_view(
     db: UserDB, page: int = 0
 ) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -282,6 +448,45 @@ async def cb_stats(callback: CallbackQuery, db: UserDB) -> None:
     text, kb = _stats_view(db)
     await callback.answer()
     await _safe_edit(callback.message, text, reply_markup=kb)
+
+
+@router.message(Command("calendar", "cal", ignore_case=True))
+async def cmd_calendar(message: Message, state: FSMContext, db: UserDB) -> None:
+    await state.clear()
+    today = today_for_user(db)
+    text, kb = build_calendar_view(db, today.year, today.month)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("cal:"))
+async def cb_calendar(callback: CallbackQuery, db: UserDB) -> None:
+    try:
+        _, year_str, month_str = (callback.data or "").split(":", 2)
+        year, month = int(year_str), int(month_str)
+    except ValueError:
+        await callback.answer("Кнопка устарела", show_alert=True)
+        return
+    text, kb = build_calendar_view(db, year, month)
+    await callback.answer()
+    await _safe_edit(callback.message, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@router.message(Command("export", "ics", ignore_case=True))
+async def cmd_export(message: Message, state: FSMContext, db: UserDB) -> None:
+    await state.clear()
+    await _send_ics(message, db)
+
+
+@router.callback_query(F.data == "export_ics")
+async def cb_export_ics(callback: CallbackQuery, db: UserDB) -> None:
+    await callback.answer()
+    if callback.message:
+        await _send_ics(callback.message, db)
 
 
 @router.callback_query(F.data == "week_menu")

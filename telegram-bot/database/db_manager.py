@@ -144,6 +144,7 @@ def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> 
             last_morning_sent TEXT,
             last_evening_sent TEXT,
             utc_offset INTEGER,
+            timezone_name TEXT,
             timezone_configured INTEGER NOT NULL DEFAULT 0,
             demo_seeded INTEGER NOT NULL DEFAULT 0,
             blocked INTEGER NOT NULL DEFAULT 0,
@@ -255,6 +256,8 @@ def _migrate_schema(
     settings_cols = _table_columns(conn, "user_settings")
     if "utc_offset" not in settings_cols:
         conn.execute("ALTER TABLE user_settings ADD COLUMN utc_offset INTEGER")
+    if "timezone_name" not in settings_cols:
+        conn.execute("ALTER TABLE user_settings ADD COLUMN timezone_name TEXT")
     if "timezone_configured" not in settings_cols:
         conn.execute(
             "ALTER TABLE user_settings ADD COLUMN timezone_configured INTEGER NOT NULL DEFAULT 0"

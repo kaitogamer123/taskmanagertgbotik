@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
-_CALLBACK_RE = re.compile(r"^[A-Za-z0-9_:.\-]+$")
+_CALLBACK_RE = re.compile(r"^[A-Za-z0-9_:.\-/]+$")
 
 
 class AntispamMiddleware(BaseMiddleware):

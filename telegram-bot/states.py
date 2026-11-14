@@ -4,6 +4,8 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class TimezoneStates(StatesGroup):
+    waiting_zone = State()
+    waiting_zone_name = State()
     waiting_hour = State()
 
 

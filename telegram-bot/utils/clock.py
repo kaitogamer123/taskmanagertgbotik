@@ -4,11 +4,70 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Optional
+from zoneinfo import ZoneInfo
 
 from config import TIMEZONE
 
 if TYPE_CHECKING:
     from database.db_manager import UserDB
+
+_ZONE_CACHE: dict[str, Optional[ZoneInfo]] = {}
+
+
+def get_zone(name: Optional[str]) -> Optional[ZoneInfo]:
+    """Возвращает ZoneInfo по имени, либо None, если имя неизвестно."""
+    if not name:
+        return None
+    if name in _ZONE_CACHE:
+        return _ZONE_CACHE[name]
+    try:
+        zone: Optional[ZoneInfo] = ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - неизвестная зона
+        zone = None
+    _ZONE_CACHE[name] = zone
+    return zone
+
+
+def now_in_zone(name: Optional[str] = None, utc_offset: Optional[int] = None) -> datetime:
+    """
+    Текущее локальное время (naive) по IANA-зоне.
+    Если зона не задана — fallback на старое целое смещение UTC.
+    """
+    zone = get_zone(name)
+    if zone is not None:
+        return datetime.now(zone).replace(tzinfo=None)
+    if utc_offset is not None:
+        return (datetime.now(timezone.utc) + timedelta(hours=int(utc_offset))).replace(
+            tzinfo=None
+        )
+    return now_local()
+
+
+def format_zone_offset(name: Optional[str], utc_offset: Optional[int]) -> str:
+    """Смещение для отображения: UTC+3, UTC+5:30 и т.п."""
+    zone = get_zone(name)
+    if zone is not None:
+        offset = datetime.now(zone).utcoffset()
+        if offset is not None:
+            total_minutes = int(offset.total_seconds() // 60)
+            sign = "+" if total_minutes >= 0 else "-"
+            total_minutes = abs(total_minutes)
+            hours, minutes = divmod(total_minutes, 60)
+            if minutes:
+                return f"UTC{sign}{hours}:{minutes:02d}"
+            return f"UTC{sign}{hours}"
+    return format_utc_offset(utc_offset)
+
+
+def zone_utc_offset_hours(name: Optional[str]) -> Optional[int]:
+    """Текущее смещение зоны в целых часах — для старого поля utc_offset."""
+    zone = get_zone(name)
+    if zone is None:
+        return None
+    offset = datetime.now(zone).utcoffset()
+    if offset is None:
+        return None
+    return int(offset.total_seconds() // 3600)
 
 
 def now_local() -> datetime:
@@ -100,10 +159,12 @@ def now_for_offset(utc_offset: Optional[int]) -> datetime:
 def now_for_user(db: "UserDB") -> datetime:
     """Текущие дата и время конкретно у данного пользователя."""
     row = db.conn.execute(
-        "SELECT utc_offset, timezone_configured FROM user_settings WHERE id = 1"
+        "SELECT utc_offset, timezone_name, timezone_configured "
+        "FROM user_settings WHERE id = 1"
     ).fetchone()
-    if row is not None and row["timezone_configured"] and row["utc_offset"] is not None:
-        return now_for_offset(int(row["utc_offset"]))
+    if row is not None and row["timezone_configured"]:
+        if row["timezone_name"] or row["utc_offset"] is not None:
+            return now_in_zone(row["timezone_name"], row["utc_offset"])
     return now_local()
 
 

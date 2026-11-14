@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 
 # Версия бота (показывается в /status и в логах при старте)
-BOT_VERSION = "2026.11.14"
+BOT_VERSION = "2026.11.14-p3"
 
 # Подхватываем .env, лежащий рядом с ботом
 load_dotenv(BASE_DIR / ".env")

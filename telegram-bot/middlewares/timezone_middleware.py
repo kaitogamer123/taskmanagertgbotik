@@ -1,8 +1,7 @@
 """
-Миддлварь первичной настройки времени.
-Если пользователь ещё ни разу не указал свой текущий час (`timezone_configured == 0`),
-бот в самом начале работы спрашивает, сколько у него сейчас времени (достаточно часа),
-чтобы определить его часовой пояс.
+Миддлварь первичной настройки часового пояса.
+Если пользователь ещё не настроил пояс, бот предлагает выбрать город/IANA-зону;
+есть резервный режим «по текущему часу».
 """
 from __future__ import annotations
 
@@ -15,17 +14,24 @@ from aiogram.types import CallbackQuery, Message, TelegramObject, User
 from config import OWNER_IDS
 from database.db_manager import UserDB
 from database.settings_repo import is_timezone_configured
-from keyboards.inline import hour_picker_keyboard
+from keyboards.inline import timezone_picker_keyboard
+from keyboards.reply import MAIN_MENU_BUTTONS
 from states import TimezoneStates
 
 FIRST_TIME_PROMPT = (
     "👋 Привет! Я бот-органайзер для твоих планов 🗓\n\n"
-    "Перед началом работы давай узнаем твой часовой пояс, чтобы задачи, "
-    "«сегодня/завтра» и все напоминания работали точно по твоему времени ⏰\n\n"
-    "🕐 <b>Сколько у тебя сейчас времени?</b>\n"
-    "Достаточно написать или нажать кнопку ниже, <b>какой у тебя сейчас час</b> "
-    "(от <code>0</code> до <code>23</code>, например <code>15</code> или <code>15:30</code>):"
+    "Перед началом работы выбери свой <b>город или часовой пояс</b>, "
+    "чтобы «сегодня/завтра» и напоминания работали точно по твоему времени.\n\n"
+    "Если нужного города нет — нажми «⌨️ Другой город» и напиши "
+    "название (например, <code>Москва</code> или <code>Europe/Moscow</code>)."
 )
+
+_ZONE_STATES = {
+    TimezoneStates.waiting_zone.state,
+    TimezoneStates.waiting_zone_name.state,
+    TimezoneStates.waiting_hour.state,
+}
+_ZONE_CALLBACKS = ("tz_hour:", "tz_set:", "tz_other", "tz_hour_mode")
 
 
 class TimezoneGateMiddleware(BaseMiddleware):
@@ -45,35 +51,43 @@ class TimezoneGateMiddleware(BaseMiddleware):
         if is_timezone_configured(db):
             return await handler(event, data)
 
-        # Разрешаем системные команды владельцу даже до настройки пояса
+        # Системные команды владельца доступны до настройки пояса
         if isinstance(event, Message) and event.text and user.id in OWNER_IDS:
             command = event.text.strip().lower().split("@", 1)[0]
-            if command in {"/update", "/status", "/restart", "/backup", "/broadcast"}:
+            if command in {
+                "/update",
+                "/status",
+                "/restart",
+                "/backup",
+                "/broadcast",
+            }:
                 return await handler(event, data)
 
         current_state = await state.get_state()
 
-        if current_state == TimezoneStates.waiting_hour.state:
-            if isinstance(event, CallbackQuery) and (event.data or "").startswith("tz_hour:"):
-                return await handler(event, data)
-            if isinstance(event, Message) and not (
-                event.text and event.text.strip().lower().startswith("/start")
-            ):
-                return await handler(event, data)
+        if current_state in _ZONE_STATES:
+            if isinstance(event, CallbackQuery):
+                if (event.data or "").startswith(_ZONE_CALLBACKS):
+                    return await handler(event, data)
+            elif isinstance(event, Message):
+                text = (event.text or "").strip()
+                if text.lower().startswith("/start"):
+                    pass  # покажем выбор пояса заново
+                elif text.startswith("/"):
+                    return await handler(event, data)
+                elif text not in MAIN_MENU_BUTTONS:
+                    return await handler(event, data)
 
-        await state.set_state(TimezoneStates.waiting_hour)
+        await state.set_state(TimezoneStates.waiting_zone)
         await state.update_data(first_setup=True)
 
+        reply_markup = timezone_picker_keyboard(allow_cancel=False)
         if isinstance(event, Message):
-            await event.answer(
-                FIRST_TIME_PROMPT,
-                reply_markup=hour_picker_keyboard(allow_cancel=False),
-            )
+            await event.answer(FIRST_TIME_PROMPT, reply_markup=reply_markup)
         elif isinstance(event, CallbackQuery):
             await event.answer()
             if event.message:
                 await event.message.answer(
-                    FIRST_TIME_PROMPT,
-                    reply_markup=hour_picker_keyboard(allow_cancel=False),
+                    FIRST_TIME_PROMPT, reply_markup=reply_markup
                 )
         return None

@@ -14,9 +14,10 @@ from database.plans_repo import (
     get_plan_counts_for_dates,
 )
 from database.settings_repo import NotifySettings
-from utils.clock import format_utc_offset
+from utils.clock import format_zone_offset
 from utils.date_utils import format_date_ru, get_week_window, weekday_name
 from utils.text import clip, clip_button
+from utils.timezones import COMMON_ZONES, zone_button_label
 
 
 def hour_picker_keyboard(allow_cancel: bool = False) -> InlineKeyboardMarkup:
@@ -25,6 +26,27 @@ def hour_picker_keyboard(allow_cancel: bool = False) -> InlineKeyboardMarkup:
     for hour in range(24):
         builder.button(text=f"{hour:02d}:xx", callback_data=f"tz_hour:{hour}")
     builder.adjust(6)
+    if allow_cancel:
+        builder.row(
+            InlineKeyboardButton(text="❌ Отмена", callback_data="tz_cancel")
+        )
+    return builder.as_markup()
+
+
+def timezone_picker_keyboard(allow_cancel: bool = False) -> InlineKeyboardMarkup:
+    """Популярные IANA-зоны + ручной ввод + старый режим по текущему часу."""
+    builder = InlineKeyboardBuilder()
+    for option in COMMON_ZONES:
+        builder.row(
+            InlineKeyboardButton(
+                text=clip_button(zone_button_label(option.name)),
+                callback_data=f"tz_set:{option.name}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="⌨️ Другой город", callback_data="tz_other"),
+        InlineKeyboardButton(text="🕐 По текущему времени", callback_data="tz_hour_mode"),
+    )
     if allow_cancel:
         builder.row(
             InlineKeyboardButton(text="❌ Отмена", callback_data="tz_cancel")
@@ -58,11 +80,18 @@ def week_days_keyboard(
         )
     )
     builder.row(
-        InlineKeyboardButton(text="📊 Статистика", callback_data="stats")
+        InlineKeyboardButton(
+            text="📆 Календарь",
+            callback_data=f"cal:{start.year}:{start.month}",
+        ),
+        InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📤 Экспорт .ics", callback_data="export_ics"),
+        InlineKeyboardButton(text="⚙️ Настройка времени", callback_data="time_menu"),
     )
     builder.row(
         InlineKeyboardButton(text="🗑 Удалить задачу", callback_data="del_menu"),
-        InlineKeyboardButton(text="⚙️ Настройка времени", callback_data="time_menu"),
     )
     return builder.as_markup()
 
@@ -469,7 +498,7 @@ def settings_keyboard(
     settings: NotifySettings, current_time_str: str
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    tz_str = format_utc_offset(settings.utc_offset)
+    tz_str = format_zone_offset(settings.timezone_name, settings.utc_offset)
     morning_mark = "✅" if settings.morning_enabled else "🚫"
     evening_mark = "✅" if settings.evening_enabled else "🚫"
 

@@ -17,6 +17,7 @@ class NotifySettings:
     last_morning_sent: Optional[str]
     last_evening_sent: Optional[str]
     utc_offset: Optional[int]
+    timezone_name: Optional[str]
     timezone_configured: bool
     demo_seeded: bool
     blocked: bool
@@ -31,7 +32,7 @@ def get_settings(db: UserDB) -> NotifySettings:
         """
         SELECT morning_enabled, morning_time, evening_enabled, evening_time,
                last_morning_sent, last_evening_sent,
-               utc_offset, timezone_configured, demo_seeded,
+               utc_offset, timezone_name, timezone_configured, demo_seeded,
                blocked, skip_empty_digest, quiet_enabled, quiet_start, quiet_end
         FROM user_settings WHERE id = 1
         """
@@ -50,6 +51,7 @@ def get_settings(db: UserDB) -> NotifySettings:
         last_morning_sent=row["last_morning_sent"],
         last_evening_sent=row["last_evening_sent"],
         utc_offset=row["utc_offset"] if row["utc_offset"] is not None else None,
+        timezone_name=row["timezone_name"] if row["timezone_name"] else None,
         timezone_configured=bool(row["timezone_configured"]),
         demo_seeded=bool(row["demo_seeded"]),
         blocked=bool(row["blocked"]),
@@ -66,8 +68,18 @@ def is_timezone_configured(db: UserDB) -> bool:
 
 def set_user_timezone_offset(db: UserDB, utc_offset: int) -> None:
     db.conn.execute(
-        "UPDATE user_settings SET utc_offset = ?, timezone_configured = 1 WHERE id = 1",
+        "UPDATE user_settings SET utc_offset = ?, timezone_name = NULL, "
+        "timezone_configured = 1 WHERE id = 1",
         (utc_offset,),
+    )
+    db.conn.commit()
+
+
+def set_user_timezone_name(db: UserDB, name: str, utc_offset: int) -> None:
+    db.conn.execute(
+        "UPDATE user_settings SET timezone_name = ?, utc_offset = ?, "
+        "timezone_configured = 1 WHERE id = 1",
+        (name, utc_offset),
     )
     db.conn.commit()
 

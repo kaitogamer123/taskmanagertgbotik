@@ -122,7 +122,7 @@ async def test_snooze(temp_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db.close()
 
     now = datetime(2026, 2, 10, 15, 0)
-    monkeypatch.setattr(notifier, "now_for_offset", lambda offset: now)
+    monkeypatch.setattr(notifier, "now_in_zone", lambda name, offset: now)
     bot = FakeBot()
     await notifier._process_user(bot, 3)
     assert any("Snooze" in text for _, text, _ in bot.messages)
