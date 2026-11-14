@@ -12,10 +12,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from database.db_manager import UserDB
-from database.seed import seed_demo_data
 from database.settings_repo import (
     get_settings,
-    mark_demo_seeded,
     set_user_timezone_name,
     set_user_timezone_offset,
 )
@@ -115,12 +113,7 @@ async def _apply_timezone(
     offset = zone_utc_offset_hours(zone_name) or 0
     set_user_timezone_name(db, zone_name, offset)
 
-    settings = get_settings(db)
     local_now = now_in_zone(zone_name, offset)
-
-    if first_setup and not settings.demo_seeded:
-        seed_demo_data(db.conn, today=local_now.date())
-        mark_demo_seeded(db)
 
     await state.clear()
 
@@ -196,12 +189,7 @@ async def _apply_user_hour(
     offset = calc_utc_offset_hours(hour)
     set_user_timezone_offset(db, offset)
 
-    settings = get_settings(db)
     local_now = now_in_zone(None, offset)
-
-    if first_setup and not settings.demo_seeded:
-        seed_demo_data(db.conn, today=local_now.date())
-        mark_demo_seeded(db)
 
     await state.clear()
 

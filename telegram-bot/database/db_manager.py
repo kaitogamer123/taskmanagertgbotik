@@ -147,6 +147,7 @@ def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> 
             timezone_name TEXT,
             timezone_configured INTEGER NOT NULL DEFAULT 0,
             demo_seeded INTEGER NOT NULL DEFAULT 0,
+            demo_cleaned INTEGER NOT NULL DEFAULT 0,
             blocked INTEGER NOT NULL DEFAULT 0,
             skip_empty_digest INTEGER NOT NULL DEFAULT 0,
             quiet_enabled INTEGER NOT NULL DEFAULT 0,
@@ -251,6 +252,37 @@ def _create_schema(conn: sqlite3.Connection, is_existing_file: bool = False) -> 
     )
 
 
+def _cleanup_demo_plans(conn: sqlite3.Connection) -> None:
+    """Удаляет старые демо-задачи, которые раньше добавлялись всем пользователям."""
+    demo_where = """
+        (title = 'сво' AND time_start = '08:30' AND time_end IS NULL)
+        OR (title = 'сво' AND time_start = '08:00' AND time_end = '08:30')
+        OR (title = 'математика' AND time_start = '08:30' AND time_end = '09:00')
+        OR (title = 'Русский диктант' AND time_start = '14:10' AND time_end = '15:00')
+        OR (title = 'Погулять со Славой если сможет + убрать пол+диван'
+            AND time_start IS NULL AND time_end IS NULL)
+        OR (title = 'В понедельник проверочная по русскому'
+            AND time_start IS NULL AND time_end IS NULL)
+    """
+    conn.execute("DROP TABLE IF EXISTS _demo_plan_ids")
+    conn.execute("CREATE TEMP TABLE _demo_plan_ids (id INTEGER PRIMARY KEY)")
+    conn.execute(
+        f"INSERT OR IGNORE INTO _demo_plan_ids (id) "
+        f"SELECT id FROM plans WHERE {demo_where}"
+    )
+    conn.execute(
+        "DELETE FROM reminder_sent WHERE reminder_id IN "
+        "(SELECT id FROM task_reminders WHERE kind = 'plan' AND source_id IN "
+        "(SELECT id FROM _demo_plan_ids))"
+    )
+    conn.execute(
+        "DELETE FROM task_reminders WHERE kind = 'plan' AND source_id IN "
+        "(SELECT id FROM _demo_plan_ids)"
+    )
+    conn.execute("DELETE FROM plans WHERE id IN (SELECT id FROM _demo_plan_ids)")
+    conn.execute("DROP TABLE _demo_plan_ids")
+
+
 def _migrate_schema(
     conn: sqlite3.Connection,
     is_existing_file: bool = False,
@@ -293,6 +325,10 @@ def _migrate_schema(
     if "demo_seeded" not in settings_cols:
         conn.execute(
             "ALTER TABLE user_settings ADD COLUMN demo_seeded INTEGER NOT NULL DEFAULT 0"
+        )
+    if "demo_cleaned" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE user_settings ADD COLUMN demo_cleaned INTEGER NOT NULL DEFAULT 0"
         )
     if "blocked" not in settings_cols:
         conn.execute(
@@ -353,6 +389,14 @@ def _migrate_schema(
     # Если база была создана старой версией бота — не подмешиваем демо-данные поверх планов юзера
     if is_existing_file and not had_demo_col_before:
         conn.execute("UPDATE user_settings SET demo_seeded = 1 WHERE id = 1")
+
+    # Одноразово удаляем старые демо-задачи, которые раньше появлялись у всех
+    row = conn.execute(
+        "SELECT demo_cleaned FROM user_settings WHERE id = 1"
+    ).fetchone()
+    if row is not None and not row["demo_cleaned"]:
+        _cleanup_demo_plans(conn)
+        conn.execute("UPDATE user_settings SET demo_cleaned = 1 WHERE id = 1")
 
     conn.commit()
 

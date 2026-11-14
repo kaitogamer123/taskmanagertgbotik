@@ -119,6 +119,59 @@ def test_daily_rules_are_not_lost(temp_env: Path) -> None:
         db.close()
 
 
+def test_demo_cleanup_on_migration(temp_env: Path) -> None:
+    path = temp_env / "demos.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE user_meta (
+            telegram_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+            created_at TEXT, last_checked REAL
+        );
+        CREATE TABLE plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, plan_date TEXT NOT NULL,
+            time_start TEXT, time_end TEXT, title TEXT NOT NULL, description TEXT,
+            reminder_minutes INTEGER, reminder_sent INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE recurring_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+            description TEXT, time_start TEXT, time_end TEXT,
+            start_date TEXT NOT NULL, rule_type TEXT NOT NULL,
+            rule_value TEXT NOT NULL, created_at TEXT,
+            reminder_minutes INTEGER, last_reminder_date TEXT,
+            excluded_dates TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE user_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            morning_enabled INTEGER NOT NULL DEFAULT 1,
+            morning_time TEXT NOT NULL DEFAULT '08:00',
+            evening_enabled INTEGER NOT NULL DEFAULT 1,
+            evening_time TEXT NOT NULL DEFAULT '20:00',
+            last_morning_sent TEXT, last_evening_sent TEXT,
+            utc_offset INTEGER, timezone_configured INTEGER NOT NULL DEFAULT 0,
+            demo_seeded INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO user_meta (telegram_id, username) VALUES (7, 'demos');
+        INSERT INTO plans (plan_date, time_start, time_end, title)
+            VALUES ('2026-01-01', '08:30', NULL, 'сво');
+        INSERT INTO plans (plan_date, time_start, time_end, title)
+            VALUES ('2026-01-01', '12:00', NULL, 'Настоящая');
+        INSERT INTO user_settings (id) VALUES (1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = dm.ensure_user_db(7, "demos", "D")
+    titles = [item.title for item in get_plans_for_date(db, date(2026, 1, 1))]
+    assert "сво" not in titles
+    assert "Настоящая" in titles
+    assert db.conn.execute(
+        "SELECT demo_cleaned FROM user_settings WHERE id = 1"
+    ).fetchone()[0] == 1
+    db.close()
+
+
 def test_index_rebuild_and_identity(temp_env: Path) -> None:
     db = dm.ensure_user_db(111, "alice", "Alice")
     db.close()

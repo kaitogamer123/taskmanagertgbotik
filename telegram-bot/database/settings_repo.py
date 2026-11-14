@@ -84,11 +84,6 @@ def set_user_timezone_name(db: UserDB, name: str, utc_offset: int) -> None:
     db.conn.commit()
 
 
-def mark_demo_seeded(db: UserDB) -> None:
-    db.conn.execute("UPDATE user_settings SET demo_seeded = 1 WHERE id = 1")
-    db.conn.commit()
-
-
 def set_morning_time(db: UserDB, time_str: str) -> None:
     db.conn.execute(
         "UPDATE user_settings SET morning_time = ?, morning_enabled = 1 WHERE id = 1",
